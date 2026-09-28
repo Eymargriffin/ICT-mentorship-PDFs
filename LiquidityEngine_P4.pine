@@ -26,6 +26,10 @@
 // Backtest (Python port, 10 years of Oanda US100 / US500 / gold / US2000 CFDs 15m + Apr–Sep 2026): defaults set to
 //          what held up in both — TP1 1R + runner 2R, midnight-open filter, 2-bar reclaim. About breakeven before
 //          costs over the 10 years (no proven edge); see docs/LE_P4_Signals_Guide.md.
+// Audit 3 (the script itself replayed bar by bar on 15m QQQ / SPY perps as US100 / US500, gold and BTC, Apr–Sep 2026,
+//          every fill, exit and alert checked): an unfilled order is withdrawn at the close of the day's (week's) last
+//          candle, so its cancel alert reaches the broker before the next session's first candle can fill it; no order is
+//          armed on that candle; alerts carry the real fill / exit price; 'valid till' shows when the order is cancelled.
 // Modes: TRADE (minimal — nearest arrays, active setup only) · CONTEXT (full picture of what price is doing).
 indicator("Liquidity Engine · Phase 4 · Setups", "LE P4", overlay = true,
      max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 500)
@@ -49,7 +53,7 @@ raidMode  = input.string("All significant", "Raid on", options = ["All significa
 K         = input.int(2, "Bars to reclaim the level", minval = 1, maxval = 10, group = gR,
      tooltip = "After the sweep, a candle must CLOSE back inside the level within this many bars. Otherwise it is a breakdown, not a raid.\n2 (15m: 30 min) — a quick rejection. Beat 3 in 10 years of US100 / US500 / gold / US2000 15m (Oanda 2010–2020, both halves) and in Apr–Sep 2026.")
 M         = input.int(24, "Max bars from raid extreme to MSS", minval = 2, maxval = 100, group = gR,
-     tooltip = "15m default 24 bars = 6 hours. Reversals often take a whole session to shift structure.")
+     tooltip = "The MSS candle can close up to this many bars after the raid extreme, plus one (15m default 24: 6 h 15 min). Reversals often take a whole session to shift structure.")
 grace     = input.int(2, "Displacement grace (bars after the break)", minval = 0, maxval = 5, group = gR,
      tooltip = "An FVG only exists once the candle AFTER the break closes, so the energy check waits this many bars before voiding.")
 tfScale   = input.bool(false, "Keep 15m clock time on other timeframes", group = gR,
@@ -126,13 +130,13 @@ kzPm      = input.session("1330-1600", "", group = gK, inline = "kp")
 minRR     = input.float(2.0, "Minimum reward:risk to final target", minval = 0.5, step = 0.25, group = gK)
 stopBuf   = input.float(0.1, "Stop buffer (× ATR)", minval = 0.0, step = 0.05, group = gK)
 fillBars  = input.int(16, "Cancel unfilled entry after (bars)", minval = 1, maxval = 200, group = gK,
-     tooltip = "15m default 16 bars = 4 hours from the moment the plan is armed.")
+     tooltip = "Counted from the candle that armed (or last moved) the order: it works for this many candles plus one and is cancelled at the close of the last of them (15m default 16: 4 h 15 min) — the time the dashboard shows as 'valid till'.")
 fillTicks = input.int(1, "Fill needs a trade-through of (ticks)", minval = 0, maxval = 50, group = gK,
      tooltip = "A limit order that is only touched often doesn't fill. 1 = price must trade at least one tick through the entry to count as filled. 0 = a touch counts (the old behaviour).")
 dayExp    = input.bool(true, "Setups expire at the daily close", group = gK,
-     tooltip = "ICT's intraday model: a raid + MSS belongs to its own trading day (the broker's daily candle — 17:00 New York on most CFDs). On: an order still unfilled at the daily close is withdrawn, and the setup is not armed again on a later day — the next day needs its own raid and MSS. Off: an order can rest and re-anchor into the next day; every re-anchor restarts 'Cancel unfilled entry after', so on 1H a fill could land a day or more after the MSS.")
+     tooltip = "ICT's intraday model: a raid + MSS belongs to its own trading day (the broker's daily candle — 17:00 New York on most CFDs). On: an order still unfilled at the daily close is withdrawn — the cancel goes out at the close of the day's last candle, and no order is armed on that candle — and the setup is not armed again on a later day: the next day needs its own raid and MSS. Off: an order can rest and re-anchor into the next day; every re-anchor restarts 'Cancel unfilled entry after', so on 1H a fill could land a day or more after the MSS.")
 wkndCancel = input.bool(true, "Withdraw unfilled orders over the weekend", group = gK,
-     tooltip = "Bars don't count over the weekend, so an order armed late on Friday would still be working at the Sunday open and could fill on the weekly opening gap. On: an unfilled order is withdrawn on the first candle of the new week. Already covered when setups expire at the daily close.")
+     tooltip = "Bars don't count over the weekend, so an order armed late on Friday would still be working at the Sunday open and could fill on the weekly opening gap. On: an unfilled order is withdrawn at the close of the week's last candle — before the weekly open — and no order is armed on that candle. Already covered when setups expire at the daily close.")
 costPts   = input.float(0.0, "Round-trip cost (price units)", minval = 0.0, step = 0.1, group = gK,
      tooltip = "Spread + commission + slippage for one trade, in price units (points). Subtracted from every closed trade's R in the track record and the trade log. 0 = no costs.")
 kzFill    = input.bool(false, "Order rests only inside killzones", group = gK,
@@ -359,6 +363,13 @@ int   biasDir = biasMode == "ICT daily bias" ? ictDir : biasMode == "HTF order f
 float dolNow  = ictDir == 0 ? na : dDir != 0 ? dDol : wDol
 bool  newDay  = timeframe.change("D")
 bool  newWeek = timeframe.change("W")
+// This candle closes at the daily / weekly session close — the last candle of the day / week. With setups expiring
+// with the day (or no orders over the weekend) an unfilled order is withdrawn at that close.
+int   dayCloseT  = time_close("D")
+int   weekCloseT = time_close("W")
+bool  dayEnd     = not na(dayCloseT) and time_close >= dayCloseT
+bool  weekEnd    = not na(weekCloseT) and time_close >= weekCloseT
+bool  closeNow   = (dayExp and dayEnd) or (wkndCancel and weekEnd)
 var bool dolHit = false    // the draw has been reached today
 var int  dayNo  = 0        // daily candles seen — a setup, and its plan, belong to the day the MSS confirmed on
 
@@ -1008,7 +1019,9 @@ f_invVis() =>
         for i = 0 to n - 1
             Zone z = inv.get(i)
             box.set_right(z.bx, bar_index)
-            line.set_x2(z.ln, bar_index)
+            // FVGs / iFVGs have no invalidation line
+            if not na(z.ln)
+                line.set_x2(z.ln, bar_index)
             label.set_x(z.lb, bar_index)
             z.vis(on.get(i))
     // Label spacing: visible labels sorted by price, each pushed up to keep a minimum gap.
@@ -1111,7 +1124,8 @@ var array<box>   histBx = array.new<box>()
 // Skip reasons: 10 grade · 11 killzone · 12 reward:risk · 13 no entry array
 // Filters: 14 against the bias · 15 midnight open · 16 no key liquidity · 17 no SMT · 18 no bias (stand aside)
 //          19 daily draw already reached · 20 wrong side of the daily range · 21 outside the trading days
-var array<int>   fun    = array.new<int>(22, 0)
+//          22 signal on the day's (week's) last candle
+var array<int>   fun    = array.new<int>(23, 0)
 
 f_bump(int i) =>
     fun.set(i, fun.get(i) + 1)
@@ -1554,7 +1568,7 @@ f_tally(Plan p) =>
              : str.startswith(p.why, "Raid took no key") ? 16 : str.startswith(p.why, "No SMT") ? 17
              : str.startswith(p.why, "No bias") ? 18 : str.startswith(p.why, "Daily draw already") ? 19
              : str.startswith(p.why, "Long in premium") or str.startswith(p.why, "Short in discount") ? 20
-             : str.startswith(p.why, "Outside the trading days") ? 21 : 13)
+             : str.startswith(p.why, "Outside the trading days") ? 21 : str.startswith(p.why, "Signal on the") ? 22 : 13)
     i
 
 // The still-valid part of an array: above its invalidation line for a bullish BB/OB, below it for a bearish one.
@@ -1764,10 +1778,11 @@ f_planBuild(Plan p, Setup a) =>
         else if na(p.rr) or p.rr < minRR
             p.state := 6
             p.why   := "Reward:risk " + str.tostring(p.rr, "#.#") + " is below " + str.tostring(minRR)
-        else if mktIn and time_close == time_close("D")
-            // A market order can't be sent after the session close — and the setup expires with the day.
+        else if (mktIn and dayEnd) or closeNow
+            // Nothing is armed on the day's (week's) last candle: a market order can't be sent after the session close,
+            // and a limit order would be withdrawn at this candle's close before any candle could fill it.
             p.state := 6
-            p.why   := "Signal on the day's last candle — no market order into the close"
+            p.why   := "Signal on the " + (dayEnd ? "day's" : "week's") + " last candle — " + (mktIn ? "no market order into the close" : "the order would be withdrawn at the close")
         else
             p.state := 1
             // A re-anchor that leaves every price where it was is not an event.
@@ -1785,11 +1800,12 @@ f_planStep(Plan p) =>
         bool  working = mktIn or not kzFill or inKZ
         if dayExp and newDay and bar_index > p.builtBi
             // The setup belongs to its own trading day — an order still resting at the daily close is withdrawn
-            // (and not re-armed: the build below only runs on the setup's own day).
+            // (and not re-armed: the build below only runs on the setup's own day). Normally that happens at the
+            // close of the day's last candle (main block); this catches a day whose last candle is missing.
             p.state := 5
             p.why   := "Setup expired at the daily close"
         else if wkndCancel and newWeek and bar_index > p.builtBi
-            // Withdrawn before the weekend — it must not fill on the weekly opening gap.
+            // Withdrawn before the weekend — it must not fill on the weekly opening gap (fallback, as above).
             p.state := 5
             p.why   := "Withdrawn over the weekend"
         else if working and bar_index > p.builtBi and (mktIn or (bull ? low <= p.entry - thru : high >= p.entry + thru))
@@ -1919,6 +1935,7 @@ bool  sigMove   = false    // the resting order was re-anchored (modify it)
 bool  sigCancel = false    // the resting order was withdrawn
 float sigFill   = na       // fill price
 int   sigExit   = 0        // +1 / −1: a trade closed in profit / at a loss
+float sigExitPx = na       // the price it closed at
 var array<label> sigLbs = array.new<label>()
 // @strategy-globals — tools/build_strategy.py inserts the strategy's inputs here (LiquidityEngine_P4_Strategy.pine)
 
@@ -2012,7 +2029,8 @@ if barstate.isconfirmed
     if (plan.state == 3 or plan.state == 4) and not plan.counted
         plan.counted := true
         float r = f_planR(plan)
-        sigExit := r > 0 ? 1 : -1
+        sigExit   := r > 0 ? 1 : -1
+        sigExitPx := nz(plan.exitPx, close)
         // The result, on the candle the trade closed — at the price it closed
         if sigShow and sigKeep > 0
             sigLbs.push(label.new(bar_index, nz(plan.exitPx, close), str.tostring(r, "+#.#;-#.#") + "R", style = label.style_label_left,
@@ -2067,7 +2085,8 @@ if barstate.isconfirmed
         bool today   = not dayExp or plan.dayNo == dayNo
         bool fresh   = plan.state == 0 and today
         bool armed   = plan.state == 1
-        bool relock  = (plan.state == 1 or plan.state >= 5) and today and act.legEnd != plan.lockEnd
+        // No re-anchor on the day's (week's) last candle: a resting order is withdrawn at its close (below).
+        bool relock  = (plan.state == 1 or plan.state >= 5) and today and act.legEnd != plan.lockEnd and not closeNow
         if fresh or relock
             f_planBuild(plan, act)
             // A re-anchor that no longer qualifies withdraws the order that was resting.
@@ -2086,6 +2105,14 @@ if barstate.isconfirmed
         plan.why   := "Setup retired before the fill"
         f_cancelAlert(plan)
         sigCancel  := true
+    // 3) Withdrawn AT the daily (weekly) close, after this candle's fill check: the cancel alert then reaches the
+    //    broker before the next session's first candle — often a gap on the reopen — could fill the order.
+    if plan.state == 1 and closeNow
+        plan.state    := 5
+        plan.why      := dayExp and dayEnd ? "Setup expired at the daily close" : "Withdrawn over the weekend"
+        plan.cancelBi := bar_index
+        f_cancelAlert(plan)
+        sigCancel     := true
     // @strategy-orders — tools/build_strategy.py inserts the strategy's order management here
 
 // Extend live levels to the current bar, apply taken-swing visibility
@@ -2260,11 +2287,12 @@ f_size(Plan p) =>
     float d = math.abs(p.entry - p.stop) * ptVal
     d > 0 ? accSize * riskPct / 100 / d : na
 
-// When a resting order lapses: the end of its fill window, or the daily close when setups expire there.
+// When a resting order is cancelled: at the close of the candle after its fill window (the timeout is checked after
+// that candle's fill check), or at the daily / weekly close when orders are withdrawn there.
 f_expTxt(Plan p) =>
-    int winEnd = time_close + math.max(0, fillW - (bar_index - p.builtBi)) * timeframe.in_seconds() * 1000
-    int dayEnd = time_close("D")
-    int t      = dayExp and not na(dayEnd) ? math.min(winEnd, dayEnd) : winEnd
+    int winEnd = time_close + math.max(0, fillW + 1 - (bar_index - p.builtBi)) * timeframe.in_seconds() * 1000
+    int t      = dayExp and not na(dayCloseT) ? math.min(winEnd, dayCloseT) : winEnd
+    t := wkndCancel and not na(weekCloseT) ? math.min(t, weekCloseT) : t
     "valid till " + str.format_time(t, "HH:mm", kzTZ) + " NY"
 
 // The full checklist as plain text — the Compact view's hover tooltip.
@@ -2385,7 +2413,7 @@ if barstate.islast and dashMode != "Off"
         f_row(3, "", off, "Raids → MSS", str.tostring(fun.get(0)) + " → " + str.tostring(fun.get(1)), "")
         f_row(4, "", off, "Voided", str.tostring(fun.get(3)) + " no MSS in time · " + str.tostring(fun.get(4)) + " no displacement · " + str.tostring(fun.get(2)) + " no reclaim · " + str.tostring(fun.get(5)) + " leg failed", "")
         f_row(5, "", off, "Plans", str.tostring(fun.get(6)) + " traded · " + str.tostring(fun.get(8)) + " cancelled · " + str.tostring(fun.get(7)) + " skipped · " + str.tostring(fun.get(9)) + " never armed", "")
-        f_row(6, "", off, "Skipped because", str.tostring(fun.get(10)) + " grade · " + str.tostring(fun.get(11)) + " killzone · " + str.tostring(fun.get(12)) + " R:R · " + str.tostring(fun.get(13)) + " no entry array in OTE", "")
+        f_row(6, "", off, "Skipped because", str.tostring(fun.get(10)) + " grade · " + str.tostring(fun.get(11)) + " killzone · " + str.tostring(fun.get(12)) + " R:R · " + str.tostring(fun.get(13)) + " no entry array in OTE · " + str.tostring(fun.get(22)) + " on the day's last candle", "")
         f_row(7, "", off, "Filtered · bias", str.tostring(fun.get(14)) + " against bias · " + str.tostring(fun.get(18)) + " no bias · " + str.tostring(fun.get(19)) + " draw reached · " + str.tostring(fun.get(20)) + " wrong side of daily EQ · " + str.tostring(fun.get(21)) + " off-day", "")
         f_row(8, "", off, "Filtered · raid", str.tostring(fun.get(15)) + " midnight open · " + str.tostring(fun.get(16)) + " no key liquidity · " + str.tostring(fun.get(17)) + " no SMT", "")
         f_row(9, "", off, "Last trades (NY)", logC.size() == 0 ? "none on this chart yet" : "trade · fill · exit", "")
@@ -2400,7 +2428,9 @@ if barstate.islast and dashMode != "Off"
 // The hidden 'Signal …' plots carry the live order's levels into the 'LE ·' alert messages ({{plot("…")}}).
 plotshape(sigShow and sigArm == 1, "Buy armed", shape.triangleup, location.belowbar, color.new(#26A69A, 0), size = size.tiny)
 plotshape(sigShow and sigArm == -1, "Sell armed", shape.triangledown, location.abovebar, color.new(#EF5350, 0), size = size.tiny)
-plot(sigShow ? sigFill : na, "Fill", color.new(chart.fg_color, 15), 4, plot.style_circles)
+// The fill price is always plotted — the 'LE · Filled' message reads it — and only drawn with 'Mark signals' on.
+plot(sigFill, "Fill", sigShow ? color.new(chart.fg_color, 15) : color(na), 4, plot.style_circles)
+plot(sigExitPx, "Signal exit", display = display.data_window)
 bool  sgLive = plan.state == 1 or plan.state == 2
 plot(sgLive ? plan.entry : na, "Signal entry", display = display.data_window)
 plot(sgLive ? plan.slNow : na, "Signal stop", display = display.data_window)
@@ -2411,4 +2441,4 @@ alertcondition(sigArm == -1, "LE · Sell armed", 'LE {{ticker}} {{interval}} · 
 alertcondition(sigMove, "LE · Order moved", 'LE {{ticker}} {{interval}} · resting order moved · entry {{plot("Signal entry")}} · SL {{plot("Signal stop")}} · TP {{plot("Signal target")}}')
 alertcondition(sigCancel, "LE · Order cancelled", 'LE {{ticker}} {{interval}} · resting order cancelled')
 alertcondition(not na(sigFill), "LE · Filled", 'LE {{ticker}} {{interval}} · order filled @ {{plot("Fill")}} · SL {{plot("Signal stop")}} · TP {{plot("Signal target")}}')
-alertcondition(sigExit != 0, "LE · Trade closed", 'LE {{ticker}} {{interval}} · trade closed @ {{close}}')
+alertcondition(sigExit != 0, "LE · Trade closed", 'LE {{ticker}} {{interval}} · trade closed @ {{plot("Signal exit")}}')
