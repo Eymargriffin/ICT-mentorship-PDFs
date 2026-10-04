@@ -33,6 +33,9 @@
 // Silver Bullet model (default): one timed window (NY AM 10:00–11:00), raid → displacement → FVG inside the window,
 //          entry at the FVG, target the nearest untaken key liquidity, at most one order a day. 'Setup model' switches
 //          back to the original Liquidity Engine entries so the two can be compared on the same chart.
+// PD arrays brought closer to ICT doctrine: order-block mean threshold (50%), blocks only where liquidity was run or at an HTF POI,
+//          order blocks as entries (A+ when paired with an FVG), displacement FVG entries on, FVG / iFVG respected at the CE (50%),
+//          first-touch arrays only, ICT-matrix priority for overlapping arrays (display only).
 // From the ICT PDFs (docs/LE_ICT_PDF_Lessons.md): key levels (PDH/PDL, Asia, London, 08:00–09:30 pre-market range, prior hour)
 //          start raids on their own, equal highs / lows are liquidity at once, the raid must engage an HTF PD array (score,
 //          optional gate), optional stand-aside news dates, stop beyond the entry array (option), breakeven off by default.
@@ -95,10 +98,22 @@ lblGap    = input.float(0.35, "Min gap between array labels (× ATR)", minval = 
      tooltip = "Keeps right-edge labels from stacking on top of each other. Raise it if labels still touch at your zoom level.")
 bbStrict  = input.bool(false, "Breaker: both raids required (strict)", group = gP,
      tooltip = "Bullish: Low → High (the High raided an earlier high) → Lower Low (raided the Low) → body close above the High. Off = only the lower-low raid is required.")
-invPct    = input.int(70, "BB / OB invalidation line (% into the body)", minval = 30, maxval = 100, step = 5, group = gP,
-     tooltip = "A body close beyond this line retires a breaker or order block, and cancels an unfilled entry on it. 70 = as tested. ICT's mean threshold for an order block is 50% of its body.")
-fvgEntry  = input.bool(false, "Displacement FVG in the OTE is an entry (ICT 2022 model)", group = gP,
-     tooltip = "Off (as tested): FVGs only prove displacement — entries come from breakers and iFVGs. On: a fresh FVG of the setup's direction inside the OTE is also an entry (grade A) when no breaker sits in the OTE. A breaker overlapping an FVG (ICT Unicorn) is graded A+ either way.")
+invPct    = input.int(70, "Breaker invalidation line (% into the body)", minval = 30, maxval = 100, step = 5, group = gP,
+     tooltip = "A body close beyond this line retires a breaker and cancels an unfilled entry on it. 70 = as tested. (Order blocks have their own line below.)")
+invPctOB  = input.int(50, "Order block invalidation line — mean threshold (% into the body)", minval = 30, maxval = 100, step = 5, group = gP,
+     tooltip = "ICT's mean threshold: the best order blocks never see a candle close beyond the middle of the body. 50 = ICT. A close beyond this line retires the block and cancels an unfilled entry on it.")
+obHtf     = input.bool(true, "Order block must form where liquidity was run or at an HTF POI", group = gP,
+     tooltip = "ICT: 'not every up-close or down-close candle is an order block' — it forms at an HTF key level or inside a liquidity pool. On: a block counts only if the leg's origin took a swing / key level (within 2 candles) or the block overlaps a same-direction HTF POI. Off: a block at every structure break, as before.")
+obEntry   = input.bool(true, "Order block in the OTE is an entry", group = gP,
+     tooltip = "ICT's primary entry (2016 mentorship): price returns to the order block. On: a fresh order block of the setup's direction inside the OTE is an entry (grade A; A+ when an FVG / iFVG overlaps it) when no breaker sits there; one in discount outside the OTE is grade B. Off: order blocks only anchor the stop.")
+fvgEntry  = input.bool(true, "Displacement FVG in the OTE is an entry (ICT 2022 model)", group = gP,
+     tooltip = "On (ICT 2022 model): a fresh FVG of the setup's direction inside the OTE is an entry (grade A) when no breaker or order block sits in the OTE. Off (as originally tested): FVGs only prove displacement. A breaker overlapping an FVG (ICT Unicorn) is graded A+ either way.")
+fvgCE     = input.bool(true, "FVG / iFVG respected at its consequent encroachment (50%)", group = gP,
+     tooltip = "ICT 2024: price should stay beyond the midpoint of the gap ('notice how it stays below CE'). On: a candle closing beyond the midpoint retires the FVG / iFVG as an entry, and cancels an unfilled entry on it; a dotted line marks the midpoint. The gap still inverts when its far edge is closed through.")
+freshOnly = input.bool(true, "Entry arrays must be untouched (first touch only)", group = gP,
+     tooltip = "ICT wants unmitigated arrays. On: an array price has already returned into (and left) is not used as an entry. Off: only broken or spent arrays are excluded.")
+rankMode  = input.string("ICT matrix", "Array priority when overlapping", options = ["ICT matrix", "Script"], group = gP,
+     tooltip = "Display / merge only. ICT MATRIX: order block over FVG / iFVG over breaker (arrays further from equilibrium in ICT's PD-array matrix rank higher). SCRIPT: breaker > iFVG > order block > FVG (the original order). Does not change which array an order is built on.")
 blkMax    = input.int(1, "Candles in a block (BB / OB)", minval = 1, maxval = 6, group = gP,
      tooltip = "1 = the LAST candle only (default, tightest range). Raise it to merge a small cluster of consecutive candles into one block.")
 legMaxAge = input.int(300, "Retire a leg after (bars)", minval = 50, maxval = 2000, group = gP,
@@ -728,6 +743,7 @@ type Zone
     bool   departed = false
     bool   tapped   = false
     bool   dead     = false
+    bool   ceBad    = false   // a candle closed beyond the gap's consequent encroachment (FVG / iFVG)
     box    bx       = na
     line   ln       = na
     label  lb       = na
@@ -749,6 +765,9 @@ method draw(Zone z) =>
          bgcolor = color.new(c, z.kind == "FVG" ? 88 : 80))
     if not na(z.l70)
         z.ln := line.new(z.leftBi, z.l70, bar_index, z.l70, color = color.new(c, 35), style = line.style_dashed, width = 1)
+    else if fvgCE and (z.kind == "FVG" or z.kind == "iFVG")
+        float ce = (z.top + z.bot) / 2
+        z.ln := line.new(z.leftBi, ce, bar_index, ce, color = color.new(c, 55), style = line.style_dotted, width = 1)
     z.lb := label.new(bar_index, (z.top + z.bot) / 2, z.kind, style = label.style_label_left,
          color = color.new(color.black, 100), textcolor = c, size = size.small, tooltip = z.tip())
     z
@@ -763,6 +782,9 @@ method upd(Zone z) =>
         float lim = na(z.l70) ? (z.bull ? z.bot : z.top) : z.l70
         if z.bull ? close < lim : close > lim
             z.dead := true
+        // Consequent encroachment: a close beyond the midpoint of a gap weakens it (FVG / iFVG have no invalidation line).
+        if na(z.l70) and (z.bull ? close < (z.top + z.bot) / 2 : close > (z.top + z.bot) / 2)
+            z.ceBad := true
     z
 
 method erase(Zone z) =>
@@ -795,7 +817,7 @@ method vis(Zone z, bool on) =>
 f_newZone(string kind, bool bull, float top, float bot, bool with70, int leftBi) =>
     Zone z = Zone.new(kind = kind, bull = bull, top = top, bot = bot, leftBi = leftBi, bornBi = bar_index)
     if with70
-        float fr = invPct / 100.0
+        float fr = (kind == "OB" ? invPctOB : invPct) / 100.0
         z.l70 := bull ? top - fr * (top - bot) : bot + fr * (top - bot)
     z
 
@@ -1004,6 +1026,32 @@ f_poiTxt() =>
                 break
     out
 
+f_hitZ(float pt, float pb, float t, float b) =>
+    not na(pt) and not na(pb) and pt >= b and pb <= t
+
+// Is [b, t] inside a same-direction HTF POI right now? (per bar — no drawings needed)
+f_backed(bool up, float t, float b) =>
+    bool ka = htfAok and (up ? (f_hitZ(aU1t, aU1b, t, b) or f_hitZ(aU2t, aU2b, t, b) or f_hitZ(aU3t, aU3b, t, b))
+                             : (f_hitZ(aD1t, aD1b, t, b) or f_hitZ(aD2t, aD2b, t, b) or f_hitZ(aD3t, aD3b, t, b)))
+    bool kb = htfBok and (up ? (f_hitZ(bU1t, bU1b, t, b) or f_hitZ(bU2t, bU2b, t, b) or f_hitZ(bU3t, bU3b, t, b))
+                             : (f_hitZ(bD1t, bD1b, t, b) or f_hitZ(bD2t, bD2b, t, b) or f_hitZ(bD3t, bD3b, t, b)))
+    ka or kb
+
+// Did the leg's origin run liquidity? A significant swing, or a key level (PDH/PDL, Asia, London, pre-market, prior hour),
+// taken within two candles of the origin bar `eb`.
+f_raidNear(bool bull, int eb) =>
+    bool ok = false
+    array<Swing> pl = bull ? lows : highs
+    for sw in pl
+        if sw.sig and sw.taken and sw.takenBi >= eb - 2 and sw.takenBi <= eb + 2
+            ok := true
+            break
+    bool key = bull ? ((pdLtk >= eb - 2 and pdLtk <= eb + 2) or (asLtk >= eb - 2 and asLtk <= eb + 2) or (lnLtk >= eb - 2 and lnLtk <= eb + 2)
+         or (pmLtk >= eb - 2 and pmLtk <= eb + 2) or (hrLtk >= eb - 2 and hrLtk <= eb + 2))
+         : ((pdHtk >= eb - 2 and pdHtk <= eb + 2) or (asHtk >= eb - 2 and asHtk <= eb + 2) or (lnHtk >= eb - 2 and lnHtk <= eb + 2)
+         or (pmHtk >= eb - 2 and pmHtk <= eb + 2) or (hrHtk >= eb - 2 and hrHtk <= eb + 2))
+    ok or key
+
 var array<Zone> inv   = array.new<Zone>()
 var array<int>  obOrg = array.from(-1, -1)    // last OB origin bar [bull, bear] — one OB per leg
 
@@ -1042,7 +1090,7 @@ f_onBreak(Swing sw, bool bull) =>
                 break
         if fu > 0
             [o0, o1, ot, ob, ohh, oll] = f_run(not bull, fu - 1, 3, sw.bi, blkMax)
-            if o0 > 0
+            if o0 > 0 and (not obHtf or f_raidNear(bull, eb) or f_backed(bull, ot, ob))
                 Zone z = f_newZone("OB", bull, ot, ob, true, o0)
                 z.wick := bull ? oll : ohh
                 f_add(z)
@@ -1103,7 +1151,9 @@ f_dist(Zone z) =>
 
 // Fresh arrays always outrank used ones; within each, BB > iFVG > OB > FVG.
 f_prio(Zone z) =>
-    (z.kind == "BB" ? 4 : z.kind == "iFVG" ? 3 : z.kind == "OB" ? 2 : 1) + (z.used ? 0 : 10)
+    int base = rankMode == "ICT matrix" ? (z.kind == "OB" ? 4 : z.kind == "iFVG" ? 3 : z.kind == "FVG" ? 3 : 2)
+         : (z.kind == "BB" ? 4 : z.kind == "iFVG" ? 3 : z.kind == "OB" ? 2 : 1)
+    base + (z.used ? 0 : 10)
 
 f_ovl(Zone a, Zone b) =>
     float o = math.min(a.top, b.top) - math.max(a.bot, b.bot)
@@ -1631,17 +1681,6 @@ f_stateTxt(Setup s) =>
 // Each candle the resting order is processed FIRST (fill → same-candle stop), and only then can the
 // plan be cancelled or replaced — as at the broker, a candle that trades through the entry fills it.
 // Lifetime (default): the trading day the setup's MSS confirmed on — unfilled at the daily close, it expires.
-f_hitZ(float pt, float pb, float t, float b) =>
-    not na(pt) and not na(pb) and pt >= b and pb <= t
-
-// Is [b, t] inside a same-direction HTF POI right now? (per bar — no drawings needed)
-f_backed(bool up, float t, float b) =>
-    bool ka = htfAok and (up ? (f_hitZ(aU1t, aU1b, t, b) or f_hitZ(aU2t, aU2b, t, b) or f_hitZ(aU3t, aU3b, t, b))
-                             : (f_hitZ(aD1t, aD1b, t, b) or f_hitZ(aD2t, aD2b, t, b) or f_hitZ(aD3t, aD3b, t, b)))
-    bool kb = htfBok and (up ? (f_hitZ(bU1t, bU1b, t, b) or f_hitZ(bU2t, bU2b, t, b) or f_hitZ(bU3t, bU3b, t, b))
-                             : (f_hitZ(bD1t, bD1b, t, b) or f_hitZ(bD2t, bD2b, t, b) or f_hitZ(bD3t, bD3b, t, b)))
-    ka or kb
-
 type Plan
     int    mss     = -1
     bool   bull    = true
@@ -1847,8 +1886,11 @@ f_planBuild(Plan p, Setup a) =>
     Zone ifv = na
     Zone fv  = na
     Zone ob  = na
+    Zone obE = na
+    Zone obH = na
     for z in inv
         if z.bull == bull and not z.dead and not z.used and z.leftBi >= a.lvlBi and z.top >= lo and z.bot <= hi
+             and not (freshOnly and z.tapped) and not (fvgCE and z.ceBad)
             [vTop, vBot] = f_valid(z)
             bool inO = vTop >= oLo and vBot <= oHi
             // Its valid part (above the invalidation line, long) reaches into discount / premium (short)
@@ -1873,8 +1915,16 @@ f_planBuild(Plan p, Setup a) =>
                     fv := z
                 else if bull ? z.top > fv.top : z.bot < fv.bot
                     fv := z
-            else if z.kind == "OB" and na(ob)
-                ob := z
+            else if z.kind == "OB"
+                if na(ob)
+                    ob := z      // the stop anchor (its wick), as before
+                if obEntry
+                    if inO
+                        if na(obE) or (bull ? z.top > obE.top : z.bot < obE.bot)
+                            obE := z
+                    else if inH
+                        if na(obH) or (bull ? z.top > obH.top : z.bot < obH.bot)
+                            obH := z
     Zone   src = na
     string g   = ""
     bool   uni = false
@@ -1885,16 +1935,33 @@ f_planBuild(Plan p, Setup a) =>
         bool withIfv = false
         for z in inv
             if z.bull == bull and not z.dead and not z.used and z.leftBi >= a.lvlBi and (z.kind == "iFVG" or z.kind == "FVG")
+                 and not (freshOnly and z.tapped) and not (fvgCE and z.ceBad)
                 if z.top >= bb.bot and z.bot <= bb.top
                     withIfv := withIfv or z.kind == "iFVG"
                     uni     := uni or z.kind == "FVG"
         if withIfv or uni
+            g := "A+"
+    else if not na(obE)
+        src := obE
+        g   := "A"
+        // A+ : an FVG or iFVG overlaps the order block (ICT: the best blocks are paired with an FVG).
+        bool obPair = false
+        for z in inv
+            if z.bull == bull and not z.dead and not z.used and z.leftBi >= a.lvlBi and (z.kind == "iFVG" or z.kind == "FVG")
+                 and not (freshOnly and z.tapped) and not (fvgCE and z.ceBad)
+                if z.top >= obE.bot and z.bot <= obE.top
+                    obPair := true
+                    uni    := uni or z.kind == "FVG"
+        if obPair
             g := "A+"
     else if fvgEntry and not na(fv)
         src := fv
         g   := "A"
     else if not na(bbH)
         src := bbH
+        g   := "B"
+    else if not na(obH)
+        src := obH
         g   := "B"
     else if not na(ifv)
         src := ifv
@@ -1912,12 +1979,12 @@ f_planBuild(Plan p, Setup a) =>
     p.star    := false
     if na(src)
         p.state := 6
-        p.why   := "No fresh entry array (BB / iFVG" + (fvgEntry ? " / FVG" : "") + ") in the " + (bull ? "discount" : "premium") + " OTE"
+        p.why   := "No fresh entry array (BB" + (obEntry ? " / OB" : "") + " / iFVG" + (fvgEntry ? " / FVG" : "") + ") in the " + (bull ? "discount" : "premium") + " OTE"
     else
         [sTop, sBot] = f_valid(src)
         bool inO = sTop >= oLo and sBot <= oHi
         p.arr   := src.kind + (uni ? "+FVG" : "")
-        p.kill  := na(src.l70) ? (bull ? src.bot : src.top) : src.l70
+        p.kill  := na(src.l70) ? (fvgCE ? (src.top + src.bot) / 2 : (bull ? src.bot : src.top)) : src.l70
         // Outside the OTE (B breaker) only the discount part of the array counts (long): a breaker straddling
         // EQ is entered at EQ, never in premium.
         p.entry := bull ? (inO ? math.min(src.top, oHi) : math.min(sTop, eq)) : (inO ? math.max(src.bot, oLo) : math.max(sBot, eq))
@@ -2085,7 +2152,7 @@ f_sbZone(bool bull, Setup s, int seen) =>
     if n > 0
         for i = n - 1 to 0
             Zone z = inv.get(i)
-            if z.kind == "FVG" and z.bull == bull and not z.dead and not z.used and z.bornBi > seen and z.leftBi >= s.extBi and bar_index - z.bornBi <= sbLookB and (bull ? z.bot > s.ext : z.top < s.ext)
+            if z.kind == "FVG" and z.bull == bull and not z.dead and not z.used and not (fvgCE and z.ceBad) and z.bornBi > seen and z.leftBi >= s.extBi and bar_index - z.bornBi <= sbLookB and (bull ? z.bot > s.ext : z.top < s.ext)
                 int k = bar_index - z.bornBi
                 if k + 1 < 400 and f_inSB(time[k])
                     float body = math.abs(close[k + 1] - open[k + 1])
@@ -2103,7 +2170,7 @@ f_sbBuild(Plan p, Setup a, Zone z) =>
     p.chg     := false
     p.arr     := "FVG"
     p.grade   := "SB"
-    p.kill    := bull ? z.bot : z.top
+    p.kill    := fvgCE ? (z.top + z.bot) / 2 : bull ? z.bot : z.top
     p.entry   := sbEntry == "FVG midpoint" ? (z.top + z.bot) / 2 : bull ? z.top : z.bot
     if mktIn
         p.entry := close
