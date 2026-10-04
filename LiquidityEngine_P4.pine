@@ -934,8 +934,14 @@ var array<int>  obOrg = array.from(-1, -1)    // last OB origin bar [bull, bear]
 
 f_add(Zone z) =>
     inv.unshift(z.draw())
+    // Over the cap the oldest FVG / iFVG goes first — a breaker or order block is never evicted by FVG volume.
     while inv.size() > 120
-        inv.pop().erase()
+        int vi = inv.size() - 1
+        for i = inv.size() - 1 to 0
+            if inv.get(i).kind == "FVG" or inv.get(i).kind == "iFVG"
+                vi := i
+                break
+        inv.remove(vi).erase()
     inv.size()
 
 // Most extreme opposite price between a broken swing and now = the leg origin.
@@ -1933,13 +1939,13 @@ f_sbTarget(bool bull, float entry, float minDist) =>
     [t, nm]
 
 // The first fresh FVG after the raid extreme, formed inside the window by a displacement candle.
-f_sbZone(bool bull, Setup s) =>
+f_sbZone(bool bull, Setup s, int seen) =>
     Zone r = na
     int  n = inv.size()
     if n > 0
         for i = n - 1 to 0
             Zone z = inv.get(i)
-            if z.kind == "FVG" and z.bull == bull and not z.dead and not z.used and z.leftBi >= s.extBi and bar_index - z.bornBi <= sbLookB and (bull ? z.bot > s.ext : z.top < s.ext)
+            if z.kind == "FVG" and z.bull == bull and not z.dead and not z.used and z.bornBi > seen and z.leftBi >= s.extBi and bar_index - z.bornBi <= sbLookB and (bull ? z.bot > s.ext : z.top < s.ext)
                 int k = bar_index - z.bornBi
                 if k + 1 < 400 and f_inWinT(sbWin, time[k])
                     float body = math.abs(close[k + 1] - open[k + 1])
@@ -2095,7 +2101,7 @@ f_planStep(Plan p) =>
                     p.tp1Bi  := bar_index
                     p.tp1Px  := bull ? math.max(open, p.tp1) : math.min(open, p.tp1)
                     if beAfter
-                        p.slNow := p.entry
+                        p.slNow := na(p.fillPx) ? p.entry : p.fillPx
                     f_alert(p, "tp1", "close " + str.tostring(partPct) + "%" + (beAfter ? " · stop to breakeven" : ""))
             if bull ? high >= p.run : low <= p.run
                 p.state   := 3
@@ -2236,9 +2242,9 @@ if barstate.isconfirmed
     // A sweep of a level INSIDE the current raid is internal — it never replaces the setup.
     // A sweep of a level BEYOND the raid extreme (deeper liquidity) re-anchors it, also while the
     // setup is still waiting for its reclaim or MSS.
-    if not na(lHitPx) and (bullS.state == 0 or lHitPx < bullExt0)
+    if not na(lHitPx) and (bullS.state == 0 or (lHitPx < bullExt0 and bullS.confBi != bar_index))
         bullS.start(lHitPx, lHitBi, lHitStrong)
-    if not na(hHitPx) and (bearS.state == 0 or hHitPx > bearExt0)
+    if not na(hHitPx) and (bearS.state == 0 or (hHitPx > bearExt0 and bearS.confBi != bar_index))
         bearS.start(hHitPx, hHitBi, hHitStrong)
     f_invStep()
     for sw in brkH
@@ -2368,7 +2374,7 @@ if barstate.isconfirmed
                 bool  dirBull = (side == 0) == bullFirst
                 Setup sb      = dirBull ? bullS : bearS
                 if not armedNow and sb.state >= (sbMss ? 3 : 2) and bar_index - sb.extBi <= sbLookB
-                    Zone zz = f_sbZone(dirBull, sb)
+                    Zone zz = f_sbZone(dirBull, sb, dirBull ? sbSeenB : sbSeenS)
                     if not na(zz)
                         if zz.bornBi != (dirBull ? sbSeenB : sbSeenS)
                             if dirBull
