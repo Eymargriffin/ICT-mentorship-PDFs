@@ -33,6 +33,9 @@
 // Silver Bullet model (default): one timed window (NY AM 10:00–11:00), raid → displacement → FVG inside the window,
 //          entry at the FVG, target the nearest untaken key liquidity, at most one order a day. 'Setup model' switches
 //          back to the original Liquidity Engine entries so the two can be compared on the same chart.
+// From the ICT PDFs (docs/LE_ICT_PDF_Lessons.md): key levels (PDH/PDL, Asia, London, 08:00–09:30 pre-market range, prior hour)
+//          start raids on their own, equal highs / lows are liquidity at once, the raid must engage an HTF PD array (score,
+//          optional gate), optional stand-aside news dates, stop beyond the entry array (option), breakeven off by default.
 // Decision engine (HTF ↔ LTF sync): every setup is scored against the daily / weekly bias and two HTF order-flow
 //          timeframes (the HTF stack) plus context (midnight open, daily prem/disc, ★, liquidity, killzone, SMT).
 //          Armed only above a minimum score and with no HTF veto; a resting order is withdrawn if the HTF stack
@@ -165,7 +168,10 @@ partPct   = input.int(50, "Partial at TP1 (%)", minval = 0, maxval = 100, group 
 tp1Mode   = input.string("Fixed R", "TP1 (partial) at", options = ["Opposing FVG", "Fixed R"], group = gK, inline = "t1",
      tooltip = "FIXED R (default 1R): always this many R from the entry. With the stop to breakeven after it, the rest of the trade is free. A closer TP1 is hit more often — a higher win rate, not a higher expectancy (10 years, 4 CFDs, 15m: TP1 0.5R 58% wins but −0.06R a trade before costs, 1R 46% / −0.04R, opposing FVG 42% / −0.05R).\nOPPOSING FVG: the nearest opposing FVG before the runner (fallback 1R).")
 tp1R      = input.float(1.0, "R", minval = 0.25, step = 0.25, group = gK, inline = "t1")
-beAfter   = input.bool(true, "Stop to breakeven after TP1", group = gK)
+beAfter   = input.bool(false, "Stop to breakeven after TP1", group = gK,
+     tooltip = "Off by default. ICT's 'running down equity': take partials at each short-term high and do NOT move the stop. Moving to breakeven on a CFD also exits at a small loss after costs, and a retest of the entry is normal. Turn on to compare.")
+stopAt    = input.string("Raid extreme", "Stop beyond (Liquidity Engine entries)", options = ["Raid extreme", "Entry array"], group = gK,
+     tooltip = "RAID EXTREME: beyond the swept low / high — wide. ENTRY ARRAY: ICT's own stop is just beyond the array (breaker high + 2 points); much tighter, so more R per trade and more stop-outs from noise and costs.")
 runMode   = input.string("Fixed R", "Runner target", options = ["−2 SD", "Nearest liquidity", "Daily draw (ICT)", "Fixed R"], group = gK, inline = "rn",
      tooltip = "Where the rest of the position is closed. FIXED R (default 2R): a plain, pre-known target — tested as well as −2 SD over 10 years and better in 2026. The reward:risk filter always uses the nearest external liquidity, as tested. The runner is never placed closer than the minimum reward:risk — when −2 SD sits nearer than that, the runner moves out to it.\nDAILY DRAW: the ICT daily bias's draw on liquidity, when the bias points the trade's way and the draw is at least the minimum reward:risk away; otherwise −2 SD.\nFIXED R: always this many R from the entry.")
 runR      = input.float(2.0, "R", minval = 0.5, step = 0.25, group = gK, inline = "rn")
@@ -217,6 +223,21 @@ sbMinATR  = input.float(2.0, "Min target distance (× ATR)", minval = 0.0, step 
 sbLiq     = input.bool(true, "Raid must take key liquidity", group = gSB)
 sbCancelEnd = input.bool(true, "Withdraw an unfilled order when the window closes", group = gSB)
 sbBg      = input.bool(true, "Shade the window", group = gSB)
+sbPM      = input.bool(false, "Also trade a second window", group = gSB, inline = "w2",
+     tooltip = "ICT's Silver Bullet zones are 03:00–04:00 (London), 10:00–11:00 (NY AM) and 14:00–15:00 (NY PM). Turn this on to trade the second window as well; raise 'Orders per day' to 2 or the AM order uses the day's only slot.")
+sbWinPM   = input.session("1400-1500", "", group = gSB, inline = "w2")
+
+string gKL = "Key liquidity (from the ICT notes)"
+keyRaid   = input.bool(true, "Key levels start raids on their own", group = gKL,
+     tooltip = "ICT's raids are of PDH / PDL, session highs and lows, the 08:00–09:30 pre-market range and the prior hour's high / low (the Silver Bullet frame) — not only of 2-bar pivots. On: sweeping an intact key level starts a setup even when no significant pivot sits at that price. Their MSS reference is the last swing high / low before the raid (ICT's short-term high), not the whole range.")
+preSess   = input.session("0800-0930", "Pre-market range (NY time)", group = gKL,
+     tooltip = "Venom Model and Silver Bullet reference range: the high and low between 08:00 and 09:30 NY. After 09:30 price runs one side to stop out early participants, then reverses.")
+eqSig     = input.bool(true, "Equal highs / lows count as liquidity at once", group = gKL,
+     tooltip = "ICT's 'relative equal highs / lows' are the cleanest stops. Two swings within the equal-level tolerance (ICT filters group) become significant immediately, without waiting for the 1 ATR excursion that would otherwise delete a quick sweep of a tight pair.")
+engReq    = input.bool(false, "Raid must engage an HTF PD array (≥ H1)", group = gKL,
+     tooltip = "Daily Profile Guide: a reversal 'lacking ≥ H1 PDA engagement' is an unfavourable profile. Requires the raid extreme to sit inside a same-direction HTF POI (the two POI timeframes in the HTF group). Off by default — it always adds to the decision score either way.")
+newsDates = input.string("", "Stand-aside dates (YYYY-MM-DD, comma separated)", group = gKL,
+     tooltip = "ICT: CPI / NFP / FOMC mornings are not tradeable — no entries before or during the release. Pine has no news calendar, so list the dates here (for example 2026-10-07,2026-11-04). No order is armed on those NY dates.")
 
 string gDE = "Decision engine (HTF ↔ LTF sync)"
 decOn     = input.bool(true, "Decision gate", group = gDE,
@@ -240,6 +261,7 @@ wStar     = input.int(1, "Weight · ★ HTF POI", minval = 0, maxval = 3, group 
 wLiq      = input.int(1, "key liquidity", minval = 0, maxval = 3, group = gDE, inline = "w4")
 wKz       = input.int(1, "Weight · killzone", minval = 0, maxval = 3, group = gDE, inline = "w5")
 wSmt      = input.int(1, "SMT", minval = 0, maxval = 3, group = gDE, inline = "w5")
+wEng      = input.int(2, "Weight · raid engages an HTF PD array", minval = 0, maxval = 3, group = gDE, inline = "w6")
 
 string gA = "Signals & alerts"
 sigShow   = input.bool(true, "Mark signals on the chart", group = gA,
@@ -291,6 +313,9 @@ f_inWinT(string sess, int t) =>
     d < (len == 0 ? 1440 : len) or (1440 - d) % 1440 < tfMin
 f_inWin(string sess) =>
     f_inWinT(sess, time)
+// Silver Bullet windows (the main one, plus an optional second)
+f_inSB(int t) =>
+    f_inWinT(sbWin, t) or (sbPM and f_inWinT(sbWinPM, t))
 bool inL  = kzUseL and f_inWin(kzLon)
 bool inA  = kzUseA and f_inWin(kzAm)
 bool inP  = kzUseP and f_inWin(kzPm)
@@ -302,6 +327,9 @@ bool inKZ = inL or inA or inP
 bool newNyDay = dayofmonth(time, kzTZ) != dayofmonth(time[1], kzTZ)
 bool inAsia   = f_inWin(asiaSess)
 bool inLonS   = f_inWin(kzLon)
+bool inPre    = f_inWin(preSess)
+bool inSB     = f_inSB(time)
+[h1H, h1L] = request.security(syminfo.tickerid, "60", [high[1], low[1]], lookahead = barmerge.lookahead_on)
 [pdH, pdL] = request.security(syminfo.tickerid, "D", [high[1], low[1]], lookahead = barmerge.lookahead_on)
 var float  midOpen = na    // NY midnight opening price of the current day
 var float  aHi     = na    // Asia range while it builds
@@ -324,6 +352,41 @@ var int    asHtk   = -1
 var int    asLtk   = -1
 var int    lnHtk   = -1
 var int    lnLtk   = -1
+// Key levels the notes treat as liquidity: the pre-market range (08:00–09:30), the prior hour's high / low at the
+// Silver Bullet window start, and the bar each level (and the previous day's extremes) was formed on.
+var float  preHi   = na
+var float  preLo   = na
+var float  preH    = na
+var float  preL    = na
+var bool   pmHok   = false
+var bool   pmLok   = false
+var int    pmHtk   = -1
+var int    pmLtk   = -1
+var float  hrH     = na
+var float  hrL     = na
+var bool   hrHok   = false
+var bool   hrLok   = false
+var int    hrHtk   = -1
+var int    hrLtk   = -1
+var int    hrBi    = 0
+var int    aHiBi   = 0
+var int    aLoBi   = 0
+var int    asiaHbi = 0
+var int    asiaLbi = 0
+var int    lHiBi   = 0
+var int    lLoBi   = 0
+var int    lonHbi  = 0
+var int    lonLbi  = 0
+var int    preHiBi = 0
+var int    preLoBi = 0
+var int    preHbi  = 0
+var int    preLbi  = 0
+var float  dHiNow  = na
+var float  dLoNow  = na
+var int    dHiNowBi = 0
+var int    dLoNowBi = 0
+var int    pdHbi   = 0
+var int    pdLbi   = 0
 
 // ── HTF order flow (closed HTF candles only) ─────────────────────────────────
 // +1 after the last close above a swing high, −1 after the last close below a swing low.
@@ -582,6 +645,18 @@ f_new(bool isHigh) =>
         if o.taken and o.sig and o.takenBi >= s.bi - 5 and o.takenBi <= s.bi and (isHigh ? o.px < s.px : o.px > s.px)
             s.wasRaid := true
             break
+    // Relative equal highs / lows: a swing next to another live swing of the same side (within tolerance) is
+    // liquidity at once, and so is its twin — a quick sweep of a tight pair must not be deleted for lack of excursion.
+    if eqSig
+        bool eqTwin = false
+        for o in pool
+            if not o.taken and math.abs(o.px - s.px) <= eqTol * s.atrAt
+                eqTwin := true
+                if not o.sig
+                    o.sig := true
+                    o.paint()
+        if eqTwin
+            s.sig := true
     if s.sig
         s.paint()
     s
@@ -1271,6 +1346,45 @@ f_energy(bool bull, int fromBi, int brkBi) =>
                 ok := true
     [ok, best]
 
+// The deepest intact key level (PDH/PDL, Asia, London, pre-market range, prior hour) taken on THIS candle, with the
+// bar it was formed on. A raid can start from it even when no 2-bar pivot sits at that price.
+f_keyHit(bool lowSide) =>
+    float px = na
+    int   bi = 0
+    if lowSide
+        if pdLtk == bar_index and pdLbi > 0 and not na(pdL) and (na(px) or pdL < px)
+            px := pdL
+            bi := pdLbi
+        if asLtk == bar_index and asiaLbi > 0 and not na(asiaL) and (na(px) or asiaL < px)
+            px := asiaL
+            bi := asiaLbi
+        if lnLtk == bar_index and lonLbi > 0 and not na(lonL) and (na(px) or lonL < px)
+            px := lonL
+            bi := lonLbi
+        if pmLtk == bar_index and preLbi > 0 and not na(preL) and (na(px) or preL < px)
+            px := preL
+            bi := preLbi
+        if hrLtk == bar_index and hrBi > 0 and not na(hrL) and (na(px) or hrL < px)
+            px := hrL
+            bi := hrBi
+    else
+        if pdHtk == bar_index and pdHbi > 0 and not na(pdH) and (na(px) or pdH > px)
+            px := pdH
+            bi := pdHbi
+        if asHtk == bar_index and asiaHbi > 0 and not na(asiaH) and (na(px) or asiaH > px)
+            px := asiaH
+            bi := asiaHbi
+        if lnHtk == bar_index and lonHbi > 0 and not na(lonH) and (na(px) or lonH > px)
+            px := lonH
+            bi := lonHbi
+        if pmHtk == bar_index and preHbi > 0 and not na(preH) and (na(px) or preH > px)
+            px := preH
+            bi := preHbi
+        if hrHtk == bar_index and hrBi > 0 and not na(hrH) and (na(px) or hrH > px)
+            px := hrH
+            bi := hrBi
+    [px, bi]
+
 // Key liquidity taken on the raid's run, from `fromBi` to now (written for a long): PDL, Asia L, London L,
 // and relatively equal lows — two significant lows within tolerance of each other, both taken on the run
 // (on the sweep candle or on the way down to it).
@@ -1288,11 +1402,11 @@ f_liqTag(bool bull, int fromBi) =>
                 eq := true
                 break
     string eqs = eq ? (bull ? "EQL " : "EQH ") : ""
-    string lvs = bull ? (pdLtk >= fromBi ? "PDL " : "") + (asLtk >= fromBi ? "Asia L " : "") + (lnLtk >= fromBi ? "London L " : "")
-         : (pdHtk >= fromBi ? "PDH " : "") + (asHtk >= fromBi ? "Asia H " : "") + (lnHtk >= fromBi ? "London H " : "")
+    string lvs = bull ? (pdLtk >= fromBi ? "PDL " : "") + (asLtk >= fromBi ? "Asia L " : "") + (lnLtk >= fromBi ? "London L " : "") + (pmLtk >= fromBi ? "Pre L " : "") + (hrLtk >= fromBi ? "Hr L " : "")
+         : (pdHtk >= fromBi ? "PDH " : "") + (asHtk >= fromBi ? "Asia H " : "") + (lnHtk >= fromBi ? "London H " : "") + (pmHtk >= fromBi ? "Pre H " : "") + (hrHtk >= fromBi ? "Hr H " : "")
     eqs + lvs
 
-method start(Setup s, float px, int bi, bool strong) =>
+method start(Setup s, float px, int bi, bool strong, bool fromKey) =>
     s.retire()
     // The last significant opposite swing before the sweep — the short-term high (long) that led price into
     // the raid. The raid's run starts there (or at the reference, if that is later).
@@ -1304,7 +1418,7 @@ method start(Setup s, float px, int bi, bool strong) =>
             break
     // Reference H1: the most extreme opposite price between the swept swing and the sweep bar.
     // Option: start from that last swing instead (ICT's short-term high; the swept swing if there is none).
-    int fromBi = refMode == "Last swing before the raid" ? lastSw : bi
+    int fromBi = refMode == "Last swing before the raid" or fromKey ? lastSw : bi
     float r  = na
     int   rb = 0
     int   span = math.min(bar_index - fromBi, 300)
@@ -1642,7 +1756,7 @@ f_tally(Plan p) =>
              : str.startswith(p.why, "Raid took no key") ? 16 : str.startswith(p.why, "No SMT") ? 17
              : str.startswith(p.why, "No bias") ? 18 : str.startswith(p.why, "Daily draw already") ? 19
              : str.startswith(p.why, "Long in premium") or str.startswith(p.why, "Short in discount") ? 20
-             : str.startswith(p.why, "Outside the trading days") ? 21 : str.startswith(p.why, "Signal on the") ? 22 : str.startswith(p.why, "Decision") ? 23 : 13)
+             : str.startswith(p.why, "Outside the trading days") ? 21 : str.startswith(p.why, "Signal on the") ? 22 : str.startswith(p.why, "Decision") or str.startswith(p.why, "HTF PD") ? 23 : 13)
     i
 
 // The still-valid part of an array: above its invalidation line for a bullish BB/OB, below it for a bearish one.
@@ -1668,10 +1782,17 @@ f_dow(int d) =>
 
 f_dayOk() =>
     int d = dayofweek(time, kzTZ)
-    dayFilter == "Any day" or (dayFilter == "Tue–Thu" and d >= dayofweek.tuesday and d <= dayofweek.thursday)
+    bool dayHit = dayFilter == "Any day" or (dayFilter == "Tue–Thu" and d >= dayofweek.tuesday and d <= dayofweek.thursday)
          or (dayFilter == "Mon–Wed" and d >= dayofweek.monday and d <= dayofweek.wednesday)
+    bool newsDay = newsDates != "" and str.contains(newsDates, str.format_time(time, "yyyy-MM-dd", kzTZ))
+    dayHit and not newsDay
 
 // ── Decision engine ────────────────────────────────────────────────────────────
+// Did the raid extreme tap a same-direction HTF POI (the notes' "HTF key level → LTF MMXM")? A small tolerance
+// around the extreme: a wick that just pokes the zone counts.
+f_engaged(bool bull, Setup a) =>
+    f_backed(bull, a.ext + 0.3 * atr, a.ext - 0.3 * atr)
+
 // Alignment of one reading with the trade: +1 agrees, −1 against, 0 unknown / neutral.
 f_al(int x, int d) =>
     x == 0 ? 0 : x == d ? 1 : -1
@@ -1693,7 +1814,7 @@ f_htfScore(bool bull) =>
     s
 
 // Returns [HTF stack score, context score, components text].
-f_decide(bool bull, float entry, Setup a, bool star, bool kz) =>
+f_decide(bool bull, float entry, Setup a, bool star, bool kz, bool eng) =>
     [aD, aW, aA, aB] = f_htfAl(bull)
     int aO = na(a.midOpen) ? 0 : bull ? (a.ext < a.midOpen ? 1 : -1) : (a.ext > a.midOpen ? 1 : -1)
     int aP = na(dEq) ? 0 : bull ? (entry < dEq ? 1 : -1) : (entry > dEq ? 1 : -1)
@@ -1701,10 +1822,11 @@ f_decide(bool bull, float entry, Setup a, bool star, bool kz) =>
     int aL = a.liq != "" ? 1 : 0
     int aK = kz ? 1 : 0
     int aM = smtOn and a.smt ? 1 : 0
+    int aE = eng ? 1 : 0
     float htfS = wDay * aD + wWk * aW + wFlA * aA + wFlB * aB
-    float ctxS = wOpn * aO + wPD * aP + wStar * aS + wLiq * aL + wKz * aK + wSmt * aM
+    float ctxS = wOpn * aO + wPD * aP + wStar * aS + wLiq * aL + wKz * aK + wSmt * aM + wEng * aE
     string txt = "D" + f_sym(aD) + " W" + f_sym(aW) + " " + f_tfName(flowTfA) + f_sym(aA) + " " + f_tfName(flowTfB) + f_sym(aB)
-         + " · open" + f_sym(aO) + " PD" + f_sym(aP) + " ★" + f_sym(aS) + " liq" + f_sym(aL) + " kz" + f_sym(aK) + (smtOn ? " smt" + f_sym(aM) : "")
+         + " · open" + f_sym(aO) + " PD" + f_sym(aP) + " ★" + f_sym(aS) + " HTFPDA" + f_sym(aE) + " liq" + f_sym(aL) + " kz" + f_sym(aK) + (smtOn ? " smt" + f_sym(aM) : "")
     [htfS, ctxS, txt]
 
 f_planBuild(Plan p, Setup a) =>
@@ -1806,6 +1928,8 @@ f_planBuild(Plan p, Setup a) =>
         if not na(ob)
             if not na(ob.wick)
                 anchor := bull ? math.min(a.ext, ob.wick) : math.max(a.ext, ob.wick)
+        if stopAt == "Entry array"
+            anchor := bull ? src.bot : src.top
         p.stop := bull ? anchor - stopBuf * atr : anchor + stopBuf * atr
         // TP2 — external liquidity beyond the leg end
         float t2 = na
@@ -1854,7 +1978,7 @@ f_planBuild(Plan p, Setup a) =>
         p.rr   := risk > 0 ? math.abs(t2 - p.entry) / risk : na
         p.star := f_backed(bull, src.top, src.bot)
         p.grade := capUnbk and not p.star and (g == "A+" or g == "A") ? "B" : g
-        [dHtf, dCtx, dTxt] = f_decide(bull, p.entry, a, p.star, a.kzOk)
+        [dHtf, dCtx, dTxt] = f_decide(bull, p.entry, a, p.star, a.kzOk, f_engaged(bull, a))
         p.score := dHtf + dCtx
         p.dtxt  := dTxt
         bool gradeOk = p.grade == "A+" or (p.grade == "A" and armGrade != "A+") or (p.grade == "B" and armGrade == "B")
@@ -1885,6 +2009,9 @@ f_planBuild(Plan p, Setup a) =>
         else if smtReq and smtOn and not a.smt
             p.state := 6
             p.why   := "No SMT divergence with " + smtSym
+        else if engReq and not f_engaged(bull, a)
+            p.state := 6
+            p.why   := "HTF PD array not engaged by the raid"
         else if decOn and dHtf <= -decVeto
             p.state := 6
             p.why   := "Decision: HTF stack against the " + (bull ? "long" : "short") + " (" + f_sg(dHtf) + " · " + dTxt + ")"
@@ -1939,6 +2066,16 @@ f_sbTarget(bool bull, float entry, float minDist) =>
     if k3 and not na(l3) and (bull ? l3 >= entry + minDist : l3 <= entry - minDist) and (na(t) or (bull ? l3 < t : l3 > t))
         t  := l3
         nm := bull ? "London H" : "London L"
+    float l4 = bull ? preH : preL
+    float l5 = bull ? hrH : hrL
+    bool  k4 = bull ? pmHok : pmLok
+    bool  k5 = bull ? hrHok : hrLok
+    if k4 and not na(l4) and (bull ? l4 >= entry + minDist : l4 <= entry - minDist) and (na(t) or (bull ? l4 < t : l4 > t))
+        t  := l4
+        nm := bull ? "Pre-mkt H" : "Pre-mkt L"
+    if k5 and not na(l5) and (bull ? l5 >= entry + minDist : l5 <= entry - minDist) and (na(t) or (bull ? l5 < t : l5 > t))
+        t  := l5
+        nm := bull ? "Prior-hr H" : "Prior-hr L"
     [t, nm]
 
 // The first fresh FVG after the raid extreme, formed inside the window by a displacement candle.
@@ -1950,7 +2087,7 @@ f_sbZone(bool bull, Setup s, int seen) =>
             Zone z = inv.get(i)
             if z.kind == "FVG" and z.bull == bull and not z.dead and not z.used and z.bornBi > seen and z.leftBi >= s.extBi and bar_index - z.bornBi <= sbLookB and (bull ? z.bot > s.ext : z.top < s.ext)
                 int k = bar_index - z.bornBi
-                if k + 1 < 400 and f_inWinT(sbWin, time[k])
+                if k + 1 < 400 and f_inSB(time[k])
                     float body = math.abs(close[k + 1] - open[k + 1])
                     if sbDisp <= 0 or body >= sbDisp * nz(atr[k + 1], atr)
                         r := z
@@ -1980,7 +2117,7 @@ f_sbBuild(Plan p, Setup a, Zone z) =>
     p.slNow := p.stop
     float risk = math.abs(p.entry - p.stop)
     p.star := f_backed(bull, z.top, z.bot)
-    [dHtf, dCtx, dTxt] = f_decide(bull, p.entry, a, p.star, true)
+    [dHtf, dCtx, dTxt] = f_decide(bull, p.entry, a, p.star, true, f_engaged(bull, a))
     p.score := dHtf + dCtx
     p.dtxt  := dTxt
     float minDist = math.max(sbMinATR * atr, minRR * risk)
@@ -2011,6 +2148,9 @@ f_sbBuild(Plan p, Setup a, Zone z) =>
     else if sbLiq and a.liq == ""
         p.state := 6
         p.why   := "Raid took no key liquidity"
+    else if engReq and not f_engaged(bull, a)
+        p.state := 6
+        p.why   := "HTF PD array not engaged by the raid"
     else if decOn and dHtf <= -decVeto
         p.state := 6
         p.why   := "Decision: HTF stack against the " + (bull ? "long" : "short") + " (" + f_sg(dHtf) + " · " + dTxt + ")"
@@ -2199,24 +2339,82 @@ if barstate.isconfirmed
         dolHit := false
         pdHok  := true
         pdLok  := true
+        pdHbi    := dHiNowBi
+        pdLbi    := dLoNowBi
+        dHiNow   := high
+        dLoNow   := low
+        dHiNowBi := bar_index
+        dLoNowBi := bar_index
+    else
+        if na(dHiNow) or high > dHiNow
+            dHiNow   := high
+            dHiNowBi := bar_index
+        if na(dLoNow) or low < dLoNow
+            dLoNow   := low
+            dLoNowBi := bar_index
     if not na(dolNow) and ictDir != 0 and (ictDir == 1 ? high >= dolNow : low <= dolNow)
         dolHit := true
     if inAsia
+        if not inAsia[1] or high > aHi
+            aHiBi := bar_index
+        if not inAsia[1] or low < aLo
+            aLoBi := bar_index
         aHi := inAsia[1] ? math.max(aHi, high) : high
         aLo := inAsia[1] ? math.min(aLo, low) : low
     else if inAsia[1]
-        asiaH := aHi
-        asiaL := aLo
+        asiaH   := aHi
+        asiaL   := aLo
+        asiaHbi := aHiBi
+        asiaLbi := aLoBi
         asHok := true
         asLok := true
     if inLonS
+        if not inLonS[1] or high > lHi
+            lHiBi := bar_index
+        if not inLonS[1] or low < lLo
+            lLoBi := bar_index
         lHi := inLonS[1] ? math.max(lHi, high) : high
         lLo := inLonS[1] ? math.min(lLo, low) : low
     else if inLonS[1]
-        lonH := lHi
-        lonL := lLo
+        lonH   := lHi
+        lonL   := lLo
+        lonHbi := lHiBi
+        lonLbi := lLoBi
         lnHok := true
         lnLok := true
+    if inPre
+        if not inPre[1] or high > preHi
+            preHiBi := bar_index
+        if not inPre[1] or low < preLo
+            preLoBi := bar_index
+        preHi := inPre[1] ? math.max(preHi, high) : high
+        preLo := inPre[1] ? math.min(preLo, low) : low
+    else if inPre[1]
+        preH   := preHi
+        preL   := preLo
+        preHbi := preHiBi
+        preLbi := preLoBi
+        pmHok  := true
+        pmLok  := true
+    // The prior hour's high / low, read once when a Silver Bullet window opens (the 09:00 candle at 10:00).
+    if inSB and not inSB[1] and not na(h1H) and not na(h1L)
+        hrH   := h1H
+        hrL   := h1L
+        hrBi  := bar_index
+        hrHok := true
+        hrLok := true
+    if pmLok and low < preL
+        pmLok := false
+        pmLtk := bar_index
+    if pmHok and high > preH
+        pmHok := false
+        pmHtk := bar_index
+    if hrLok and low < hrL
+        hrLok := false
+        hrLtk := bar_index
+    if hrHok and high > hrH
+        hrHok := false
+        hrHtk := bar_index
     if pdLok and low < pdL
         pdLok := false
         pdLtk := bar_index
@@ -2237,6 +2435,27 @@ if barstate.isconfirmed
         lnHtk := bar_index
     [hHitPx, hHitBi, hHitStrong] = f_update(highs)
     [lHitPx, lHitBi, lHitStrong] = f_update(lows)
+    // Key levels taken on this candle can start a raid on their own; the deepest level (or swing) wins.
+    [kLoPx, kLoBi] = f_keyHit(true)
+    [kHiPx, kHiBi] = f_keyHit(false)
+    float lRaidPx  = lHitPx
+    int   lRaidBi  = lHitBi
+    bool  lRaidStr = lHitStrong
+    bool  lRaidKey = false
+    float hRaidPx  = hHitPx
+    int   hRaidBi  = hHitBi
+    bool  hRaidStr = hHitStrong
+    bool  hRaidKey = false
+    if keyRaid and not na(kLoPx) and (na(lRaidPx) or kLoPx < lRaidPx)
+        lRaidPx  := kLoPx
+        lRaidBi  := kLoBi
+        lRaidStr := false
+        lRaidKey := true
+    if keyRaid and not na(kHiPx) and (na(hRaidPx) or kHiPx > hRaidPx)
+        hRaidPx  := kHiPx
+        hRaidBi  := kHiBi
+        hRaidStr := false
+        hRaidKey := true
     // Raid extremes BEFORE this candle — step() extends them to this candle's wick.
     float bullExt0 = bullS.ext
     float bearExt0 = bearS.ext
@@ -2245,10 +2464,10 @@ if barstate.isconfirmed
     // A sweep of a level INSIDE the current raid is internal — it never replaces the setup.
     // A sweep of a level BEYOND the raid extreme (deeper liquidity) re-anchors it, also while the
     // setup is still waiting for its reclaim or MSS.
-    if not na(lHitPx) and (bullS.state == 0 or (lHitPx < bullExt0 and bullS.confBi != bar_index))
-        bullS.start(lHitPx, lHitBi, lHitStrong)
-    if not na(hHitPx) and (bearS.state == 0 or (hHitPx > bearExt0 and bearS.confBi != bar_index))
-        bearS.start(hHitPx, hHitBi, hHitStrong)
+    if not na(lRaidPx) and (bullS.state == 0 or (lRaidPx < bullExt0 and bullS.confBi != bar_index))
+        bullS.start(lRaidPx, lRaidBi, lRaidStr, lRaidKey)
+    if not na(hRaidPx) and (bearS.state == 0 or (hRaidPx > bearExt0 and bearS.confBi != bar_index))
+        bearS.start(hRaidPx, hRaidBi, hRaidStr, hRaidKey)
     f_invStep()
     for sw in brkH
         f_onBreak(sw, true)
@@ -2362,14 +2581,14 @@ if barstate.isconfirmed
         if sbCntDay != dayNo
             sbCnt    := 0
             sbCntDay := dayNo
-        bool nextIn = f_inWinT(sbWin, time_close)
+        bool nextIn = f_inSB(time_close)
         if plan.state == 1 and sbCancelEnd and not nextIn
             plan.state    := 5
             plan.why      := "Silver Bullet window closed before the fill"
             plan.cancelBi := bar_index
             f_cancelAlert(plan)
             sigCancel     := true
-        bool winNow = f_inWin(sbWin) and (not sbCancelEnd or nextIn)
+        bool winNow = f_inSB(time) and (not sbCancelEnd or nextIn)
         if winNow and sbCnt < sbPerDay and plan.state != 1 and plan.state != 2 and not closeNow
             bool bullFirst = f_htfScore(true) >= f_htfScore(false)
             bool armedNow  = false
@@ -2625,7 +2844,7 @@ if barstate.islast and dashMode != "Off"
         string tip  = f_checkTxt(a)
         string head = plan.state == 1 ? (plan.bull ? "▲ BUY " : "▼ SELL ") + (mktIn ? "MARKET " : "LIMIT ") + plan.arr + " " + plan.grade + (plan.star ? " ★" : "") + (plan.early and not mktIn ? " · follows the leg" : "")
              : plan.state == 2 ? (plan.bull ? "● LONG " : "● SHORT ") + plan.arr + " " + plan.grade + " · in trade" + (plan.tp1Hit ? " · TP1 ✓" + (beAfter ? " · SL at BE" : "") : "")
-             : sbOn ? "Silver Bullet · " + (f_inWin(sbWin) ? "window open" : "waiting for " + str.substring(sbWin, 0, 2) + ":" + str.substring(sbWin, 2, 4)) + " · " + str.tostring(sbCnt) + "/" + str.tostring(sbPerDay) + " today" + (plan.state == 5 or plan.state == 6 ? " · last " + f_shortSt(plan) : plan.state == 3 or plan.state == 4 ? " · last " + f_shortSt(plan) : "")
+             : sbOn ? "Silver Bullet · " + (f_inSB(time) ? "window open" : "waiting for " + str.substring(sbWin, 0, 2) + ":" + str.substring(sbWin, 2, 4)) + " · " + str.tostring(sbCnt) + "/" + str.tostring(sbPerDay) + " today" + (plan.state == 5 or plan.state == 6 ? " · last " + f_shortSt(plan) : plan.state == 3 or plan.state == 4 ? " · last " + f_shortSt(plan) : "")
              : na(a) ? "No active setup" : (a.bull ? "▲ Long setup · " : "▼ Short setup · ") + f_shortSt(plan)
         string hIc  = plan.state == 2 ? "●" : plan.state == 1 ? "◐" : plan.state == 3 ? "✓" : plan.state == 4 ? "✗" : "○"
         color  hCol = plan.state == 1 or plan.state == 2 ? mid : plan.state == 3 ? ok : plan.state == 4 ? bad : off
@@ -2649,7 +2868,7 @@ if barstate.islast and dashMode != "Off"
             if ((not na(a) and plan.mss == a.mssBi) or (sbOn and plan.state != 0)) and (plan.state == 5 or plan.state == 6)
                 f_row(2, "", off, plan.why, "", tip)
     else if dashMode == "Checklist"
-        string head = sbOn ? "Silver Bullet · " + (f_inWin(sbWin) ? "window open" : "outside the window") + " · " + str.tostring(sbCnt) + "/" + str.tostring(sbPerDay) + " today"
+        string head = sbOn ? "Silver Bullet · " + (f_inSB(time) ? "window open" : "outside the window") + " · " + str.tostring(sbCnt) + "/" + str.tostring(sbPerDay) + " today"
              : na(a) ? (plan.state == 2 ? "Live trade · its setup has ended" : "No active setup")
              : (a.bull ? "Long" : "Short") + " setup" + (plan.mss == a.mssBi and plan.state >= 1 and plan.state != 6 ? " · " + plan.grade + (plan.star ? " ★" : "") : "")
         f_row(0, "", off, head, timeframe.period, "")
@@ -2731,7 +2950,7 @@ if barstate.islast and dashMode != "Off"
 // ── Signals on the chart & alert conditions ────────────────────────────────
 // ▲ / ▼ on the candle whose close armed the order, a dot at the fill, the result in R where it closed.
 // The hidden 'Signal …' plots carry the live order's levels into the 'LE ·' alert messages ({{plot("…")}}).
-bgcolor(sbOn and sbBg and f_inWin(sbWin) ? color.new(#FFD54F, 92) : na, title = "Silver Bullet window")
+bgcolor(sbOn and sbBg and f_inSB(time) ? color.new(#FFD54F, 92) : na, title = "Silver Bullet window")
 plotshape(sigShow and sigArm == 1, "Buy armed", shape.triangleup, location.belowbar, color.new(#26A69A, 0), size = size.tiny)
 plotshape(sigShow and sigArm == -1, "Sell armed", shape.triangledown, location.abovebar, color.new(#EF5350, 0), size = size.tiny)
 // The fill price is always plotted — the 'LE · Filled' message reads it — and only drawn with 'Mark signals' on.
