@@ -1363,6 +1363,9 @@ method confirm(Setup s, float best) =>
     s.mssBi    := mb
     s.confBi   := bar_index
     s.dayNo    := dayNo
+    // The NY midnight open in force at the MSS — a raid before the next midnight (Asia evening) must not be judged
+    // against the previous day's open, which is 20+ hours old by then.
+    s.midOpen  := midOpen
     s.legEnd   := le
     s.legEndBi := leBi
     s.dispMax  := best
