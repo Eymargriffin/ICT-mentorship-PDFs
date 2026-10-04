@@ -30,6 +30,9 @@
 //          every fill, exit and alert checked): an unfilled order is withdrawn at the close of the day's (week's) last
 //          candle, so its cancel alert reaches the broker before the next session's first candle can fill it; no order is
 //          armed on that candle; alerts carry the real fill / exit price; 'valid till' shows when the order is cancelled.
+// Silver Bullet model (default): one timed window (NY AM 10:00–11:00), raid → displacement → FVG inside the window,
+//          entry at the FVG, target the nearest untaken key liquidity, at most one order a day. 'Setup model' switches
+//          back to the original Liquidity Engine entries so the two can be compared on the same chart.
 // Decision engine (HTF ↔ LTF sync): every setup is scored against the daily / weekly bias and two HTF order-flow
 //          timeframes (the HTF stack) plus context (midnight open, daily prem/disc, ★, liquidity, killzone, SMT).
 //          Armed only above a minimum score and with no HTF veto; a resting order is withdrawn if the HTF stack
@@ -191,6 +194,30 @@ smtSym    = input.symbol("", "SMT: correlated symbol", group = gF,
      tooltip = "e.g. US500 when trading US100, and the other way round. At the MSS the engine checks whether this symbol FAILED to take its matching swing while your chart took it — SMT divergence. Empty = off.")
 smtReq    = input.bool(false, "Require SMT divergence", group = gF)
 
+string gSB = "Setup model · Silver Bullet"
+setupMode = input.string("Silver Bullet", "Setup model", options = ["Silver Bullet", "Liquidity Engine"], group = gSB,
+     tooltip = "SILVER BULLET (ICT): one timed window per day (NY AM 10:00–11:00 by default). A raid of key liquidity (previous day / Asia / London / swing highs and lows) → displacement → a fair value gap formed INSIDE the window → entry at the FVG, stop beyond the raid (or the FVG candles), target the nearest untaken key liquidity at least the minimum reward:risk away. At most N orders per day. Setups are the engine's raids and MSS; only the timing, the entry and the target differ.\nLIQUIDITY ENGINE: the original model — entry array (breaker / iFVG) in the OTE of the displacement leg, any time of day inside the killzones.\nRun both on the same chart and instrument and compare the Stats rows before trading either.")
+sbWin     = input.session("1000-1100", "Window (NY time)", group = gSB,
+     tooltip = "The FVG must form inside this window, and the order is armed only while it is open. Classic Silver Bullets: 03:00–04:00 (London), 10:00–11:00 (NY AM), 14:00–15:00 (NY PM).")
+sbPerDay  = input.int(1, "Orders per day", minval = 1, maxval = 3, group = gSB)
+sbLookMin = input.int(180, "Raid no older than (minutes)", minval = 15, maxval = 720, group = gSB,
+     tooltip = "The raid extreme must be this recent when the FVG is judged. 180 = a London raid is too old for a 10:00 entry; a raid from 07:00 onward counts.")
+sbMss     = input.bool(true, "Require the MSS (displacement through the short-term high)", group = gSB,
+     tooltip = "On: the engine's MSS must be confirmed (energy + close through the reference). Off: a raid with reclaim is enough, but the FVG's middle candle must still be a displacement candle (see below).")
+sbDisp    = input.float(1.0, "Displacement candle ≥ (× ATR body)", minval = 0.0, step = 0.1, group = gSB,
+     tooltip = "The middle candle of the FVG must be a real displacement candle: body at least this many ATR. 0 = no check.")
+sbEntry   = input.string("FVG edge", "Entry in the FVG", options = ["FVG edge", "FVG midpoint"], group = gSB,
+     tooltip = "FVG EDGE: the near edge (top for a long) — fills most often. MIDPOINT (consequent encroachment): a better price, fills less often. The earlier backtests found deeper entries filled less and did no better.")
+sbStop    = input.string("Raid extreme", "Stop beyond", options = ["Raid extreme", "FVG candles"], group = gSB,
+     tooltip = "RAID EXTREME: beyond the swept low (long) — wider, the engine's stop. FVG CANDLES: beyond the lowest low of the three FVG candles — much tighter, so costs and slippage matter more.")
+sbTarget  = input.string("Key liquidity", "Target", options = ["Key liquidity", "Fixed R"], group = gSB,
+     tooltip = "KEY LIQUIDITY: the nearest untaken level beyond the entry (PDH / PDL, Asia, London, significant swing) at least 'Min target distance' and 'Minimum reward:risk' away; no such level → no trade. FIXED R: the 'Runner' R from the Execution group.")
+sbMinATR  = input.float(2.0, "Min target distance (× ATR)", minval = 0.0, step = 0.25, group = gSB,
+     tooltip = "ICT teaches a minimum target (about 15–20 points on NQ). In ATR so it works on any symbol: 2 × ATR(14) is roughly 16 points on a 5m NQ chart.")
+sbLiq     = input.bool(true, "Raid must take key liquidity", group = gSB)
+sbCancelEnd = input.bool(true, "Withdraw an unfilled order when the window closes", group = gSB)
+sbBg      = input.bool(true, "Shade the window", group = gSB)
+
 string gDE = "Decision engine (HTF ↔ LTF sync)"
 decOn     = input.bool(true, "Decision gate", group = gDE,
      tooltip = "Scores every setup against the higher timeframes before an order is armed. Each component adds its weight when it AGREES with the trade, subtracts it when it is AGAINST, and counts 0 when unknown (e.g. a timeframe at or below the chart's).\nCOMPONENTS: daily bias, weekly bias, mid-TF order flow, high-TF order flow (HTF stack) · raid vs NY midnight open, entry in discount (long) / premium (short) of the daily range, ★ HTF POI backing, key liquidity taken, killzone, SMT (context).\nARM only when score ≥ 'Min score' and the HTF stack is not against by the veto amount. The chart timeframe is the LTF — it finds the raid, MSS and entry; the HTF stack says whether to take it.\nNOT TUNED: the weights and thresholds are starting values, not a tested edge. Use 'R by score' on the Stats dashboard to see whether the score separates winners from losers on your instrument.")
@@ -238,9 +265,11 @@ cLow      = input.color(#1D9E75, "Lows", group = gD, inline = "c")
 cMuted    = input.color(color.new(#787B86, 40), "Pending / taken", group = gD, inline = "c")
 
 float atr = ta.atr(14)
+bool  sbOn = setupMode == "Silver Bullet"
 
 // Bar windows tuned on 15m — optionally converted so they keep the same clock time on any timeframe.
 float tfMin = timeframe.in_seconds() / 60.0
+int   sbLookB = math.max(1, math.round(sbLookMin / tfMin))
 f_win(int bars15) =>
     tfScale ? math.max(1, math.round(bars15 * 15.0 / tfMin)) : bars15
 int Kw    = f_win(K)
@@ -255,11 +284,13 @@ f_hhmm(string s, int at) =>
 // A candle is inside a window when any part of it overlaps the window. On 15m and below that is the candle
 // opening inside it; on 1H the 08:00 candle holds the 08:30 open, and on 4H a window can fall between two
 // candle opens and would otherwise never register (London, with 4H candles opening 01:00 / 05:00 NY).
-f_inWin(string sess) =>
+f_inWinT(string sess, int t) =>
     int w0  = f_hhmm(sess, 0)
     int len = (f_hhmm(sess, 5) - w0 + 1440) % 1440
-    int d   = (hour(time, kzTZ) * 60 + minute(time, kzTZ) - w0 + 1440) % 1440   // candle open, minutes after the window opens
+    int d   = (hour(t, kzTZ) * 60 + minute(t, kzTZ) - w0 + 1440) % 1440   // candle open, minutes after the window opens
     d < (len == 0 ? 1440 : len) or (1440 - d) % 1440 < tfMin
+f_inWin(string sess) =>
+    f_inWinT(sess, time)
 bool inL  = kzUseL and f_inWin(kzLon)
 bool inA  = kzUseA and f_inWin(kzAm)
 bool inP  = kzUseP and f_inWin(kzPm)
@@ -1653,13 +1684,13 @@ f_htfScore(bool bull) =>
     s
 
 // Returns [HTF stack score, context score, components text].
-f_decide(bool bull, float entry, Setup a, bool star) =>
+f_decide(bool bull, float entry, Setup a, bool star, bool kz) =>
     [aD, aW, aA, aB] = f_htfAl(bull)
     int aO = na(a.midOpen) ? 0 : bull ? (a.ext < a.midOpen ? 1 : -1) : (a.ext > a.midOpen ? 1 : -1)
     int aP = na(dEq) ? 0 : bull ? (entry < dEq ? 1 : -1) : (entry > dEq ? 1 : -1)
     int aS = star ? 1 : 0
     int aL = a.liq != "" ? 1 : 0
-    int aK = a.kzOk ? 1 : 0
+    int aK = kz ? 1 : 0
     int aM = smtOn and a.smt ? 1 : 0
     float htfS = wDay * aD + wWk * aW + wFlA * aA + wFlB * aB
     float ctxS = wOpn * aO + wPD * aP + wStar * aS + wLiq * aL + wKz * aK + wSmt * aM
@@ -1814,7 +1845,7 @@ f_planBuild(Plan p, Setup a) =>
         p.rr   := risk > 0 ? math.abs(t2 - p.entry) / risk : na
         p.star := f_backed(bull, src.top, src.bot)
         p.grade := capUnbk and not p.star and (g == "A+" or g == "A") ? "B" : g
-        [dHtf, dCtx, dTxt] = f_decide(bull, p.entry, a, p.star)
+        [dHtf, dCtx, dTxt] = f_decide(bull, p.entry, a, p.star, a.kzOk)
         p.score := dHtf + dCtx
         p.dtxt  := dTxt
         bool gradeOk = p.grade == "A+" or (p.grade == "A" and armGrade != "A+") or (p.grade == "B" and armGrade == "B")
@@ -1869,6 +1900,121 @@ f_planBuild(Plan p, Setup a) =>
                  or nz(p.tp1, -1) != nz(pT0, -1) or nz(p.run, -1) != nz(pR0, -1)
             if p.chg
                 f_alert(p, wasArmed ? "moved" : "armed", "score " + f_sg(p.score) + (p.early ? " · leg still forming, the entry follows it" : ""))
+    p
+
+// ══ SILVER BULLET ════════════════════════════════════════════════════════════
+// Uses the engine's raids and MSS. Inside the window: the first fresh FVG of the setup's direction that formed
+// AFTER the raid extreme, inside the window, from a displacement candle → entry at the FVG, stop beyond the raid,
+// target the nearest untaken key liquidity far enough away. Each FVG is judged once; at most `sbPerDay` orders a day.
+f_sbTarget(bool bull, float entry, float minDist) =>
+    float t  = na
+    string nm = ""
+    array<Swing> pool = bull ? highs : lows
+    for sw in pool
+        if sw.sig and not sw.taken and (bull ? sw.px >= entry + minDist : sw.px <= entry - minDist)
+            if na(t) or (bull ? sw.px < t : sw.px > t)
+                t  := sw.px
+                nm := "swing"
+    float l1 = bull ? pdH : pdL
+    float l2 = bull ? asiaH : asiaL
+    float l3 = bull ? lonH : lonL
+    bool  k1 = bull ? pdHok : pdLok
+    bool  k2 = bull ? asHok : asLok
+    bool  k3 = bull ? lnHok : lnLok
+    if k1 and not na(l1) and (bull ? l1 >= entry + minDist : l1 <= entry - minDist) and (na(t) or (bull ? l1 < t : l1 > t))
+        t  := l1
+        nm := bull ? "PDH" : "PDL"
+    if k2 and not na(l2) and (bull ? l2 >= entry + minDist : l2 <= entry - minDist) and (na(t) or (bull ? l2 < t : l2 > t))
+        t  := l2
+        nm := bull ? "Asia H" : "Asia L"
+    if k3 and not na(l3) and (bull ? l3 >= entry + minDist : l3 <= entry - minDist) and (na(t) or (bull ? l3 < t : l3 > t))
+        t  := l3
+        nm := bull ? "London H" : "London L"
+    [t, nm]
+
+// The first fresh FVG after the raid extreme, formed inside the window by a displacement candle.
+f_sbZone(bool bull, Setup s) =>
+    Zone r = na
+    int  n = inv.size()
+    if n > 0
+        for i = n - 1 to 0
+            Zone z = inv.get(i)
+            if z.kind == "FVG" and z.bull == bull and not z.dead and not z.used and z.leftBi >= s.extBi and bar_index - z.bornBi <= sbLookB and (bull ? z.bot > s.ext : z.top < s.ext)
+                int k = bar_index - z.bornBi
+                if k + 1 < 400 and f_inWinT(sbWin, time[k])
+                    float body = math.abs(close[k + 1] - open[k + 1])
+                    if sbDisp <= 0 or body >= sbDisp * nz(atr[k + 1], atr)
+                        r := z
+                        break
+    r
+
+f_sbBuild(Plan p, Setup a, Zone z) =>
+    bool bull = a.bull
+    p.builtBi := bar_index
+    p.early   := false
+    p.lockEnd := na
+    p.tp1Hit  := false
+    p.chg     := false
+    p.arr     := "FVG"
+    p.grade   := "SB"
+    p.kill    := bull ? z.bot : z.top
+    p.entry   := sbEntry == "FVG midpoint" ? (z.top + z.bot) / 2 : bull ? z.top : z.bot
+    if mktIn
+        p.entry := close
+    int   k0     = bar_index - z.bornBi
+    float anchor = a.ext
+    if sbStop == "FVG candles"
+        anchor := bull ? low[k0] : high[k0]
+        for j = k0 to k0 + 2
+            anchor := bull ? math.min(anchor, low[j]) : math.max(anchor, high[j])
+    p.stop  := bull ? anchor - stopBuf * atr : anchor + stopBuf * atr
+    p.slNow := p.stop
+    float risk = math.abs(p.entry - p.stop)
+    p.star := f_backed(bull, z.top, z.bot)
+    [dHtf, dCtx, dTxt] = f_decide(bull, p.entry, a, p.star, true)
+    p.score := dHtf + dCtx
+    p.dtxt  := dTxt
+    float minDist = math.max(sbMinATR * atr, minRR * risk)
+    [tq, tName] = f_sbTarget(bull, p.entry, minDist)
+    float fixedT = bull ? p.entry + runR * risk : p.entry - runR * risk
+    bool  liqMode = sbTarget == "Key liquidity"
+    p.run    := liqMode ? tq : fixedT
+    p.tp2    := tq
+    p.runTxt := liqMode ? tName : str.tostring(runR) + "R"
+    p.rr     := risk > 0 and not na(p.run) ? math.abs(p.run - p.entry) / risk : na
+    float t1  = bull ? p.entry + tp1R * risk : p.entry - tp1R * risk
+    p.tp1    := not na(p.run) and (bull ? t1 < p.run : t1 > p.run) ? t1 : na
+    if not (risk > 0)
+        p.state := 6
+        p.why   := "Reward:risk — no valid stop"
+    else if biasOn and biasDir == (bull ? -1 : 1)
+        p.state := 6
+        p.why   := "Against the bias (" + f_biasTxt() + ")"
+    else if biasOn and biasDir == 0 and noBias == "Stand aside"
+        p.state := 6
+        p.why   := "No bias today (" + f_biasTxt() + ") — standing aside"
+    else if not f_dayOk()
+        p.state := 6
+        p.why   := "Outside the trading days (" + dayFilter + ", today " + f_dow(dayofweek(time, kzTZ)) + ")"
+    else if openOn and not na(a.midOpen) and (bull ? a.ext >= a.midOpen : a.ext <= a.midOpen)
+        p.state := 6
+        p.why   := "Raid on the wrong side of the NY midnight open " + str.tostring(a.midOpen, format.mintick)
+    else if sbLiq and a.liq == ""
+        p.state := 6
+        p.why   := "Raid took no key liquidity"
+    else if decOn and dHtf <= -decVeto
+        p.state := 6
+        p.why   := "Decision: HTF stack against the " + (bull ? "long" : "short") + " (" + f_sg(dHtf) + " · " + dTxt + ")"
+    else if decOn and p.score < decMin
+        p.state := 6
+        p.why   := "Decision: score " + f_sg(p.score) + " is below " + str.tostring(decMin) + " (" + dTxt + ")"
+    else if na(p.run) or (not liqMode and runR < minRR)
+        p.state := 6
+        p.why   := "Reward:risk — " + (liqMode ? "no untaken key liquidity at least " + str.tostring(minDist, format.mintick) + " away" : "the fixed target is below " + str.tostring(minRR) + "R")
+    else
+        p.state := 1
+        p.chg   := true
+        f_alert(p, "armed", "Silver Bullet · score " + f_sg(p.score) + " · target " + p.runTxt)
     p
 
 f_planStep(Plan p) =>
@@ -2004,6 +2150,11 @@ var float  kzR = 0.0
 var int    okN = 0
 var int    okW = 0
 var float  okR = 0.0
+// Silver Bullet: orders armed today, and the last FVG judged per side (each FVG is judged once)
+var int sbCnt    = 0
+var int sbCntDay = -1
+var int sbSeenB  = -1
+var int sbSeenS  = -1
 // Closed trades by decision score: <=0 · 1-2 · 3-4 · 5-6 · 7-8 · 9+
 var array<int>   scN = array.new<int>(6, 0)
 var array<int>   scW = array.new<int>(6, 0)
@@ -2159,7 +2310,7 @@ if barstate.isconfirmed
             logR.pop()
     // 2) Only then can a newer setup take over an unfilled plan.
     // A live trade (filled) is never replaced — it runs to its stop or target.
-    Setup act = f_act()
+    Setup act = sbOn ? na : f_act()
     if not na(act) and act.mssBi != plan.mss and plan.state != 2
         if plan.state == 1
             plan.state := 5
@@ -2192,11 +2343,48 @@ if barstate.isconfirmed
                     sigArm  := plan.bull ? 1 : -1
         if act.state == 4
             plan.early := false
-    if na(act) and plan.state == 1
+    if na(act) and plan.state == 1 and not sbOn
         plan.state := 5
         plan.why   := "Setup retired before the fill"
         f_cancelAlert(plan)
         sigCancel  := true
+    // Silver Bullet: arm inside the window, withdraw what is still unfilled when it closes.
+    if sbOn
+        if sbCntDay != dayNo
+            sbCnt    := 0
+            sbCntDay := dayNo
+        bool nextIn = f_inWinT(sbWin, time_close)
+        if plan.state == 1 and sbCancelEnd and not nextIn
+            plan.state    := 5
+            plan.why      := "Silver Bullet window closed before the fill"
+            plan.cancelBi := bar_index
+            f_cancelAlert(plan)
+            sigCancel     := true
+        bool winNow = f_inWin(sbWin) and (not sbCancelEnd or nextIn)
+        if winNow and sbCnt < sbPerDay and plan.state != 1 and plan.state != 2 and not closeNow
+            bool bullFirst = f_htfScore(true) >= f_htfScore(false)
+            bool armedNow  = false
+            for side = 0 to 1
+                bool  dirBull = (side == 0) == bullFirst
+                Setup sb      = dirBull ? bullS : bearS
+                if not armedNow and sb.state >= (sbMss ? 3 : 2) and bar_index - sb.extBi <= sbLookB
+                    Zone zz = f_sbZone(dirBull, sb)
+                    if not na(zz)
+                        if zz.bornBi != (dirBull ? sbSeenB : sbSeenS)
+                            if dirBull
+                                sbSeenB := zz.bornBi
+                            else
+                                sbSeenS := zz.bornBi
+                            Plan np = Plan.new(mss = bar_index, bull = dirBull, dayNo = dayNo, lns = array.new<line>(), lbs = array.new<label>())
+                            f_sbBuild(np, sb, zz)
+                            if plan.mss >= 0
+                                f_tally(plan)
+                            f_planWipe(plan)
+                            plan := np
+                            if np.state == 1
+                                sbCnt   += 1
+                                sigArm  := dirBull ? 1 : -1
+                                armedNow := true
     // 3) Withdrawn AT the daily (weekly) close, after this candle's fill check: the cancel alert then reaches the
     //    broker before the next session's first candle — often a gap on the reopen — could fill the order.
     if plan.state == 1 and closeNow
@@ -2253,7 +2441,7 @@ f_band(int x1, int x2, float a, float b, color c, int t, string txt, bool strong
 
 f_drawRange() =>
     f_rgClear()
-    Setup a = f_act()
+    Setup a = sbOn ? na : f_act()
     if not na(a)
         bool  bull = a.bull
         float lo   = bull ? a.ext : a.legEnd
@@ -2301,7 +2489,7 @@ f_drawRange() =>
 // Where price sits in the active range (dashboard)
 f_rangeTxt() =>
     string out = "—"
-    Setup a = f_act()
+    Setup a = sbOn ? na : f_act()
     if not na(a)
         float lo = a.bull ? a.ext : a.legEnd
         float hi = a.bull ? a.legEnd : a.ext
@@ -2368,7 +2556,7 @@ f_shortSt(Plan p) =>
 // The plan shown with a setup: its own plan — or a live trade from an earlier setup, which runs to its stop or
 // target after its setup is gone (retired, failed, or replaced by an MSS the other way).
 f_planShown(Setup a) =>
-    (not na(a) and plan.mss == a.mssBi) or plan.state == 2
+    sbOn ? plan.state != 0 : (not na(a) and plan.mss == a.mssBi) or plan.state == 2
 
 f_execTxt() =>
     float rrR = f_rrRun(plan)
@@ -2412,7 +2600,7 @@ if barstate.islast and dashMode != "Off"
     color bad = #EF5350
     color mid = #FF9800
     color off = color.new(chart.fg_color, 60)
-    Setup  a     = f_act()
+    Setup  a     = sbOn ? na : f_act()
     bool   live  = plan.state == 1 or plan.state == 2
     string kzNow = inL ? "London live" : inA ? "NY AM live" : inP ? "NY PM live" : "closed"
     // ✓ / ✗ = the live plan (else the active setup) is with / against the bias in use (the ICT reading when the
@@ -2428,6 +2616,7 @@ if barstate.islast and dashMode != "Off"
         string tip  = f_checkTxt(a)
         string head = plan.state == 1 ? (plan.bull ? "▲ BUY " : "▼ SELL ") + (mktIn ? "MARKET " : "LIMIT ") + plan.arr + " " + plan.grade + (plan.star ? " ★" : "") + (plan.early and not mktIn ? " · follows the leg" : "")
              : plan.state == 2 ? (plan.bull ? "● LONG " : "● SHORT ") + plan.arr + " " + plan.grade + " · in trade" + (plan.tp1Hit ? " · TP1 ✓" + (beAfter ? " · SL at BE" : "") : "")
+             : sbOn ? "Silver Bullet · " + (f_inWin(sbWin) ? "window open" : "waiting for " + str.substring(sbWin, 0, 2) + ":" + str.substring(sbWin, 2, 4)) + " · " + str.tostring(sbCnt) + "/" + str.tostring(sbPerDay) + " today" + (plan.state == 5 or plan.state == 6 ? " · last " + f_shortSt(plan) : plan.state == 3 or plan.state == 4 ? " · last " + f_shortSt(plan) : "")
              : na(a) ? "No active setup" : (a.bull ? "▲ Long setup · " : "▼ Short setup · ") + f_shortSt(plan)
         string hIc  = plan.state == 2 ? "●" : plan.state == 1 ? "◐" : plan.state == 3 ? "✓" : plan.state == 4 ? "✗" : "○"
         color  hCol = plan.state == 1 or plan.state == 2 ? mid : plan.state == 3 ? ok : plan.state == 4 ? bad : off
@@ -2448,10 +2637,11 @@ if barstate.islast and dashMode != "Off"
             f_row(3, withB ? "✓" : vsB ? "✗" : "○", withB ? ok : vsB ? bad : off, line2, "", tip)
         else
             f_row(1, withB ? "✓" : vsB ? "✗" : "○", withB ? ok : vsB ? bad : off, line2, "", tip)
-            if not na(a) and plan.mss == a.mssBi and (plan.state == 5 or plan.state == 6)
+            if ((not na(a) and plan.mss == a.mssBi) or (sbOn and plan.state != 0)) and (plan.state == 5 or plan.state == 6)
                 f_row(2, "", off, plan.why, "", tip)
     else if dashMode == "Checklist"
-        string head = na(a) ? (plan.state == 2 ? "Live trade · its setup has ended" : "No active setup")
+        string head = sbOn ? "Silver Bullet · " + (f_inWin(sbWin) ? "window open" : "outside the window") + " · " + str.tostring(sbCnt) + "/" + str.tostring(sbPerDay) + " today"
+             : na(a) ? (plan.state == 2 ? "Live trade · its setup has ended" : "No active setup")
              : (a.bull ? "Long" : "Short") + " setup" + (plan.mss == a.mssBi and plan.state >= 1 and plan.state != 6 ? " · " + plan.grade + (plan.star ? " ★" : "") : "")
         f_row(0, "", off, head, timeframe.period, "")
         string poi = f_poiTxt()
@@ -2532,6 +2722,7 @@ if barstate.islast and dashMode != "Off"
 // ── Signals on the chart & alert conditions ────────────────────────────────
 // ▲ / ▼ on the candle whose close armed the order, a dot at the fill, the result in R where it closed.
 // The hidden 'Signal …' plots carry the live order's levels into the 'LE ·' alert messages ({{plot("…")}}).
+bgcolor(sbOn and sbBg and f_inWin(sbWin) ? color.new(#FFD54F, 92) : na, title = "Silver Bullet window")
 plotshape(sigShow and sigArm == 1, "Buy armed", shape.triangleup, location.belowbar, color.new(#26A69A, 0), size = size.tiny)
 plotshape(sigShow and sigArm == -1, "Sell armed", shape.triangledown, location.abovebar, color.new(#EF5350, 0), size = size.tiny)
 // The fill price is always plotted — the 'LE · Filled' message reads it — and only drawn with 'Mark signals' on.
