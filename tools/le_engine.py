@@ -86,11 +86,11 @@ def inwin(mod, w0, ln, tfmin=15):
 
 
 class Swing:
-    __slots__ = ("bi", "px", "wm", "is_high", "atr_at", "ext", "graded", "strong", "sig", "taken", "taken_bi", "was_raid")
+    __slots__ = ("bi", "px", "wm", "is_high", "atr_at", "ext", "graded", "strong", "sig", "taken", "taken_bi", "was_raid", "broken")
 
     def __init__(self, bi, px, wm, is_high, atr_at):
         self.bi = bi; self.px = px; self.wm = wm; self.is_high = is_high; self.atr_at = atr_at; self.ext = px
-        self.graded = False; self.strong = True; self.sig = False; self.taken = False; self.taken_bi = 0; self.was_raid = False
+        self.graded = False; self.strong = True; self.sig = False; self.taken = False; self.taken_bi = 0; self.was_raid = False; self.broken = False
 
 
 class Setup:
@@ -763,9 +763,9 @@ class Engine:
             self.step(self.bull, i)
             self.step(self.bear, i)
             if lRaid is not None and (self.bull.state == 0 or (lRaid < bull_ext0 and self.bull.conf_bi != i)):
-                self.start(self.bull, lRaid, lRaidBi, lKey, i)
+                self.start(self.bull, lRaid, lRaidBi, lKey, i); self.bull.lvl_strong = (lS and not lKey)
             if hRaid is not None and (self.bear.state == 0 or (hRaid > bear_ext0 and self.bear.conf_bi != i)):
-                self.start(self.bear, hRaid, hRaidBi, hKey, i)
+                self.start(self.bear, hRaid, hRaidBi, hKey, i); self.bear.lvl_strong = (hS and not hKey)
             self.inv_step(i)
             if self.is_pivot(i, True):
                 self.highs.insert(0, self.new_swing(i, True))
